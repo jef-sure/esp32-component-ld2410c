@@ -154,6 +154,15 @@ typedef struct
  */
 ld2410c_handle_t *ld2410c_init(uart_port_t port, int timeout_ms);
 
+/**
+ * @brief Free an LD2410C handle and set the pointer to NULL.
+ *
+ * Does not deinitialize UART — that must be done separately.
+ *
+ * @param handle Pointer to the handle variable. NULL is safe.
+ */
+void ld2410c_deinit(ld2410c_handle_t **handle);
+
 /* ========================================================================== */
 /*  Low-level commands (require enable_config / end_config wrapping)          */
 /* ========================================================================== */
@@ -295,6 +304,23 @@ esp_err_t ld2410c_parse_target_data(const uint8_t *frame, size_t len, ld2410c_ta
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG if frame is not engineering mode.
  */
 esp_err_t ld2410c_parse_engineering_data(const uint8_t *frame, size_t len, ld2410c_engineering_data_t *data);
+
+/**
+ * @brief Read a raw data frame from UART.
+ *
+ * Blocks until a complete data frame (header F4 F3 F2 F1 ... tail F8 F7 F6 F5)
+ * is received, or timeout expires. The raw buffer can then be passed to
+ * ld2410c_parse_target_data() or ld2410c_parse_engineering_data().
+ *
+ * @param handle   Driver handle.
+ * @param buf      Buffer to receive raw UART data.
+ * @param buf_size Size of the buffer (recommend >= 64).
+ * @param[out] out_len Number of bytes actually read.
+ * @return ESP_OK if a complete data frame was found,
+ *         ESP_ERR_NOT_FOUND if data was received but no valid frame,
+ *         ESP_ERR_TIMEOUT if no data was received.
+ */
+esp_err_t ld2410c_read_data_frame(ld2410c_handle_t *handle, uint8_t *buf, size_t buf_size, size_t *out_len);
 
 /* ========================================================================== */
 /*  High-level convenience functions (auto-wrap enable_config/end_config)     */

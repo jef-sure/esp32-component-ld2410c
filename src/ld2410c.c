@@ -37,7 +37,6 @@ enum
     CMD_RESTART         = 0x00A3,
     CMD_SET_BT          = 0x00A4,
     CMD_GET_MAC         = 0x00A5,
-    CMD_BT_PASSWORD     = 0x00A8,
     CMD_SET_BT_PASS     = 0x00A9,
     CMD_SET_RESOLUTION  = 0x00AA,
     CMD_GET_RESOLUTION  = 0x00AB,
@@ -52,34 +51,38 @@ enum
 
 /* ---------- low-level helpers ---------- */
 
-static void frame_begin(uint8_t *buf, size_t *pos)
+static size_t frame_begin(uint8_t *buf, size_t pos)
 {
-    buf[(*pos)++] = CMD_HEADER_0;
-    buf[(*pos)++] = CMD_HEADER_1;
-    buf[(*pos)++] = CMD_HEADER_2;
-    buf[(*pos)++] = CMD_HEADER_3;
+    buf[pos + 0] = CMD_HEADER_0;
+    buf[pos + 1] = CMD_HEADER_1;
+    buf[pos + 2] = CMD_HEADER_2;
+    buf[pos + 3] = CMD_HEADER_3;
+    return pos + 4;
 }
 
-static void frame_end(uint8_t *buf, size_t *pos)
+static size_t frame_end(uint8_t *buf, size_t pos)
 {
-    buf[(*pos)++] = CMD_TAIL_0;
-    buf[(*pos)++] = CMD_TAIL_1;
-    buf[(*pos)++] = CMD_TAIL_2;
-    buf[(*pos)++] = CMD_TAIL_3;
+    buf[pos + 0] = CMD_TAIL_0;
+    buf[pos + 1] = CMD_TAIL_1;
+    buf[pos + 2] = CMD_TAIL_2;
+    buf[pos + 3] = CMD_TAIL_3;
+    return pos + 4;
 }
 
-static void put_u16(uint8_t *buf, size_t *pos, uint16_t val)
+static size_t put_u16(uint8_t *buf, size_t pos, uint16_t val)
 {
-    buf[(*pos)++] = val & 0xFF;
-    buf[(*pos)++] = (val >> 8) & 0xFF;
+    buf[pos + 0] = val & 0xFF;
+    buf[pos + 1] = (val >> 8) & 0xFF;
+    return pos + 2;
 }
 
-static void put_u32(uint8_t *buf, size_t *pos, uint32_t val)
+static size_t put_u32(uint8_t *buf, size_t pos, uint32_t val)
 {
-    buf[(*pos)++] = val & 0xFF;
-    buf[(*pos)++] = (val >> 8) & 0xFF;
-    buf[(*pos)++] = (val >> 16) & 0xFF;
-    buf[(*pos)++] = (val >> 24) & 0xFF;
+    buf[pos + 0] = val & 0xFF;
+    buf[pos + 1] = (val >> 8) & 0xFF;
+    buf[pos + 2] = (val >> 16) & 0xFF;
+    buf[pos + 3] = (val >> 24) & 0xFF;
+    return pos + 4;
 }
 
 static uint16_t get_u16(const uint8_t *buf, size_t off)
@@ -94,16 +97,22 @@ static uint32_t get_u32(const uint8_t *buf, size_t off)
 
 static size_t build_frame(uint8_t *buf, uint16_t cmd, const uint8_t *value, size_t value_len)
 {
-    size_t pos = 0;
-    frame_begin(buf, &pos);
+    /* header(4) + len(2) + cmd(2) + value + tail(4) */
+    size_t total = 4 + 2 + 2 + value_len + 4;
+    if (total > MAX_FRAME_SIZE) {
+        ESP_LOGE(TAG, "Frame too large: %u > %u", (unsigned)total, MAX_FRAME_SIZE);
+        return 0;
+    }
+
+    size_t pos = frame_begin(buf, 0);
     uint16_t data_len = 2 + value_len; /* cmd word + value */
-    put_u16(buf, &pos, data_len);
-    put_u16(buf, &pos, cmd);
+    pos = put_u16(buf, pos, data_len);
+    pos = put_u16(buf, pos, cmd);
     if (value && value_len > 0) {
         memcpy(&buf[pos], value, value_len);
         pos += value_len;
     }
-    frame_end(buf, &pos);
+    pos = frame_end(buf, pos);
     return pos;
 }
 
@@ -175,6 +184,11 @@ static esp_err_t recv_ack(ld2410c_handle_t *handle, uint16_t expected_cmd, uint8
             if (out_buf && out_buf_size > 0) {
                 size_t val_len  = data_len > 4 ? data_len - 4 : 0; /* subtract cmd(2) + status(2) */
                 size_t copy_len = val_len < out_buf_size ? val_len : out_buf_size;
+                /* Guard against reading past received data */
+                if (hdr + 10 + copy_len > (size_t)total) {
+                    ESP_LOGE(TAG, "ACK data exceeds buffer");
+                    return ESP_ERR_INVALID_RESPONSE;
+                }
                 memcpy(out_buf, &buf[hdr + 10], copy_len);
                 if (out_len) *out_len = copy_len;
             }
@@ -192,6 +206,8 @@ static esp_err_t send_command(ld2410c_handle_t *handle, uint16_t cmd, const uint
 {
     uint8_t frame[MAX_FRAME_SIZE];
     size_t  frame_len = build_frame(frame, cmd, value, value_len);
+
+    if (frame_len == 0) return ESP_ERR_INVALID_SIZE;
 
     /* Flush RX before sending */
     uart_flush_input(handle->uart_port);
@@ -220,6 +236,13 @@ ld2410c_handle_t *ld2410c_init(uart_port_t port, int timeout_ms)
     return handle;
 }
 
+void ld2410c_deinit(ld2410c_handle_t **handle)
+{
+    if (!handle) return;
+    free(*handle);
+    *handle = NULL;
+}
+
 esp_err_t ld2410c_enable_config(ld2410c_handle_t *handle)
 {
     uint8_t value[2] = {0x01, 0x00};
@@ -236,16 +259,15 @@ esp_err_t ld2410c_end_config(ld2410c_handle_t *handle)
 esp_err_t ld2410c_set_max_gate_and_duration(ld2410c_handle_t *handle, uint8_t max_moving_gate, uint8_t max_stationary_gate, uint16_t no_one_duration_s)
 {
     uint8_t value[18];
-    size_t  pos = 0;
     /* max motion distance gate word + value */
-    put_u16(value, &pos, 0x0000);
-    put_u32(value, &pos, max_moving_gate);
+    size_t pos = put_u16(value, 0, 0x0000);
+    pos = put_u32(value, pos, max_moving_gate);
     /* max stationary distance gate word + value */
-    put_u16(value, &pos, 0x0001);
-    put_u32(value, &pos, max_stationary_gate);
+    pos = put_u16(value, pos, 0x0001);
+    pos = put_u32(value, pos, max_stationary_gate);
     /* no-one duration word + value */
-    put_u16(value, &pos, 0x0002);
-    put_u32(value, &pos, no_one_duration_s);
+    pos = put_u16(value, pos, 0x0002);
+    pos = put_u32(value, pos, no_one_duration_s);
 
     return send_command(handle, CMD_SET_MAX_GATE, value, pos, NULL, 0, NULL);
 }
@@ -286,13 +308,12 @@ esp_err_t ld2410c_read_params(ld2410c_handle_t *handle, ld2410c_params_t *params
 esp_err_t ld2410c_set_gate_sensitivity(ld2410c_handle_t *handle, uint16_t gate, uint8_t moving_sensitivity, uint8_t stationary_sensitivity)
 {
     uint8_t value[18];
-    size_t  pos = 0;
-    put_u16(value, &pos, 0x0000);
-    put_u32(value, &pos, gate);
-    put_u16(value, &pos, 0x0001);
-    put_u32(value, &pos, moving_sensitivity);
-    put_u16(value, &pos, 0x0002);
-    put_u32(value, &pos, stationary_sensitivity);
+    size_t pos = put_u16(value, 0, 0x0000);
+    pos = put_u32(value, pos, gate);
+    pos = put_u16(value, pos, 0x0001);
+    pos = put_u32(value, pos, moving_sensitivity);
+    pos = put_u16(value, pos, 0x0002);
+    pos = put_u32(value, pos, stationary_sensitivity);
 
     return send_command(handle, CMD_SET_GATE_SENS, value, pos, NULL, 0, NULL);
 }
@@ -332,8 +353,7 @@ esp_err_t ld2410c_read_firmware_version(ld2410c_handle_t *handle, ld2410c_firmwa
 esp_err_t ld2410c_set_baud_rate(ld2410c_handle_t *handle, ld2410c_baud_t baud)
 {
     uint8_t value[2];
-    size_t  pos = 0;
-    put_u16(value, &pos, (uint16_t)baud);
+    size_t pos = put_u16(value, 0, (uint16_t)baud);
     return send_command(handle, CMD_SET_BAUD, value, pos, NULL, 0, NULL);
 }
 
@@ -350,8 +370,7 @@ esp_err_t ld2410c_restart(ld2410c_handle_t *handle)
 esp_err_t ld2410c_set_bluetooth(ld2410c_handle_t *handle, bool enable)
 {
     uint8_t value[2];
-    size_t  pos = 0;
-    put_u16(value, &pos, enable ? 0x0001 : 0x0000);
+    size_t pos = put_u16(value, 0, enable ? 0x0001 : 0x0000);
     return send_command(handle, CMD_SET_BT, value, pos, NULL, 0, NULL);
 }
 
@@ -378,8 +397,7 @@ esp_err_t ld2410c_set_bluetooth_password(ld2410c_handle_t *handle, const char pa
 esp_err_t ld2410c_set_distance_resolution(ld2410c_handle_t *handle, ld2410c_resolution_t res)
 {
     uint8_t value[2];
-    size_t  pos = 0;
-    put_u16(value, &pos, (uint16_t)res);
+    size_t pos = put_u16(value, 0, (uint16_t)res);
     return send_command(handle, CMD_SET_RESOLUTION, value, pos, NULL, 0, NULL);
 }
 
@@ -423,8 +441,7 @@ esp_err_t ld2410c_get_aux_control(ld2410c_handle_t *handle, ld2410c_aux_ctrl_t *
 esp_err_t ld2410c_start_noise_detection(ld2410c_handle_t *handle, uint16_t duration_s)
 {
     uint8_t value[2];
-    size_t  pos = 0;
-    put_u16(value, &pos, duration_s);
+    size_t pos = put_u16(value, 0, duration_s);
     return send_command(handle, CMD_START_NOISE_DET, value, pos, NULL, 0, NULL);
 }
 
@@ -539,6 +556,28 @@ esp_err_t ld2410c_parse_engineering_data(const uint8_t *frame, size_t len, ld241
     data->out_pin_state  = d[off++];
 
     return ESP_OK;
+}
+
+esp_err_t ld2410c_read_data_frame(ld2410c_handle_t *handle, uint8_t *buf, size_t buf_size, size_t *out_len)
+{
+    int        total   = 0;
+    TickType_t timeout = pdMS_TO_TICKS(handle->timeout_ms);
+
+    while ((size_t)total < buf_size) {
+        int n = uart_read_bytes(handle->uart_port, &buf[total], buf_size - total, timeout);
+        if (n <= 0) break;
+        total += n;
+
+        /* Look for a complete data frame */
+        size_t frame_start, frame_len;
+        if (find_data_frame(buf, total, &frame_start, &frame_len) == 0) {
+            if (out_len) *out_len = total;
+            return ESP_OK;
+        }
+    }
+
+    if (out_len) *out_len = total;
+    return (total > 0) ? ESP_ERR_NOT_FOUND : ESP_ERR_TIMEOUT;
 }
 
 /* ---------- high-level functions ---------- */
