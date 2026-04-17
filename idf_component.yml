@@ -1,0 +1,44 @@
+## IDF Component Manager Manifest File
+version: "0.0.1"
+description: "ESP-IDF driver for HLK-LD2410C human presence sensing radar module with UART communication"
+url: https://github.com/jef-sure/esp32-component-ld2410c
+repository: https://github.com/jef-sure/esp32-component-ld2410c.git
+documentation: https://github.com/jef-sure/esp32-component-ld2410c/blob/main/README.md
+issues: https://github.com/jef-sure/esp32-component-ld2410c/issues
+
+dependencies:
+  idf:
+    version: ">=5.0.0"
+
+tags:
+  - radar
+  - mmwave
+  - ld2410c
+  - presence-detection
+  - human-presence
+  - motion-sensor
+  - uart
+
+maintainers:
+  - "Anton Petrusevich <anton.petrusevich.mobile@gmail.com>"
+
+license: MIT
+
+files:
+  include:
+    - "src/**/*.c"
+    - "include/**/*.h"
+    - "CMakeLists.txt"
+    - "examples/**/*.c"
+    - "examples/**/*.h"
+    - "examples/CMakeLists.txt"
+    - "examples/sdkconfig"
+    - "README.md"
+    - "LICENSE"
+  exclude:
+    - "build/**"
+    - "dist/**"
+    - ".git/**"
+    - ".vscode/**"
+    - "**/*.old"
+
