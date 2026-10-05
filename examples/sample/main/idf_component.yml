@@ -1,0 +1,4 @@
+dependencies:
+  jef-sure/ld2410c:
+    version: "*"
+    override_path: "../../../"

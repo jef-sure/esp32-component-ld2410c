@@ -11,13 +11,33 @@ UART data frames and the OUT pin.
 | GPIO 17   | RX          |
 | GPIO 16   | TX          |
 | GPIO 4    | OUT         |
-| 3.3V      | VCC         |
+| 5V (VIN)  | VCC         |
 | GND       | GND         |
+
+The module must be powered from 5 V with a supply able to deliver more than
+200 mA; it does not work reliably from the 3.3 V rail. Its UART and OUT pins use
+3.3 V logic levels, so they connect to the ESP32 GPIOs directly.
 
 ## Build and Flash
 
 ```bash
 idf.py build flash monitor
+```
+
+The sample pulls the driver from the repository it lives in (`override_path`
+in [main/idf_component.yml](main/idf_component.yml)). ESP-IDF names a local
+component after its directory, so when building from a git checkout the
+checkout directory must be named `ld2410c`:
+
+```bash
+git clone https://github.com/jef-sure/esp32-component-ld2410c.git ld2410c
+cd ld2410c/examples/sample
+```
+
+Alternatively, create the project from the registry:
+
+```bash
+idf.py create-project-from-example "jef-sure/ld2410c:sample"
 ```
 
 ## What It Does

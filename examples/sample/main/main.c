@@ -17,6 +17,7 @@ enum
     UART_TX_PIN    = 17,
     UART_RX_PIN    = 16,
     UART_BUF_SIZE  = 256,
+    FRAME_BUF_SIZE = 64,
     LD2410C_OUT_PIN = 4,
 };
 
@@ -57,6 +58,7 @@ static void out_pin_init(void)
     ESP_ERROR_CHECK(gpio_config(&io_conf));
 
     s_out_pin_queue = xQueueCreate(4, sizeof(uint32_t));
+    ESP_ERROR_CHECK(s_out_pin_queue ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
     ESP_ERROR_CHECK(gpio_isr_handler_add(LD2410C_OUT_PIN, out_pin_isr_handler, NULL));
 }
@@ -74,7 +76,8 @@ static const char *target_state_str(ld2410c_target_state_t state)
 
 static void presence_monitor_task(void *arg)
 {
-    uint8_t               buf[UART_BUF_SIZE];
+    uint8_t               buf[FRAME_BUF_SIZE];
+    size_t                len;
     ld2410c_target_data_t target;
     ld2410c_target_state_t last_state = LD2410C_TARGET_NONE;
     uint32_t out_level;
@@ -87,8 +90,9 @@ static void presence_monitor_task(void *arg)
             ESP_LOGW(TAG, "OUT pin: %s", out_level ? "PRESENCE" : "NO PRESENCE");
         }
 
-        int len = uart_read_bytes(UART_PORT_NUM, buf, sizeof(buf), pdMS_TO_TICKS(100));
-        if (len <= 0) continue;
+        /* Returns exactly one frame; the rest stays buffered in the UART driver,
+           so frames split across UART chunks are not lost */
+        if (ld2410c_read_data_frame(s_ld, buf, sizeof(buf), &len) != ESP_OK) continue;
 
         if (ld2410c_parse_target_data(buf, len, &target) != ESP_OK) continue;
 
@@ -136,6 +140,7 @@ void app_main(void)
     uart_init();
     out_pin_init();
     s_ld = ld2410c_init(UART_PORT_NUM, 1000);
+    ESP_ERROR_CHECK(s_ld ? ESP_OK : ESP_ERR_NO_MEM);
 
     /* Give the module time to start up */
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -158,6 +163,9 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to configure detection: %s", esp_err_to_name(err));
     }
 
-    /* Start continuous presence monitoring */
-    xTaskCreate(presence_monitor_task, "presence", 4096, NULL, 10, NULL);
+    /* Start continuous presence monitoring. The driver is not thread-safe:
+       from here on only the monitor task may use s_ld. */
+    if (xTaskCreate(presence_monitor_task, "presence", 4096, NULL, 10, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create presence monitor task");
+    }
 }

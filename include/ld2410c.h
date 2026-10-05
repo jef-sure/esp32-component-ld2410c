@@ -7,6 +7,16 @@
  * high-level convenience wrappers, and data frame parsers.
  *
  * Default UART settings: 256000 baud, 8N1, no flow control.
+ *
+ * All functions taking a handle return ESP_ERR_INVALID_ARG for a NULL handle,
+ * NULL output pointer, or out-of-range parameter.
+ *
+ * Thread safety: the driver does no locking. Every command function flushes
+ * the UART RX buffer and then reads the ACK from it, so commands must not run
+ * concurrently with each other or with ld2410c_read_data_frame() (or any
+ * other reader of the same UART). Either use the handle from a single task or
+ * serialize access with your own mutex. The ld2410c_parse_*() functions touch
+ * no shared state and are safe to call from any task.
  */
 #pragma once
 
@@ -108,20 +118,25 @@ typedef struct
 /** Radar configuration parameters as read from the module. */
 typedef struct
 {
-    uint8_t  max_moving_gate;                                    /**< Configured max moving gate (1-8). */
-    uint8_t  max_stationary_gate;                                /**< Configured max stationary gate (1-8). */
+    uint8_t  max_moving_gate;                                    /**< Configured max moving gate (2-8). */
+    uint8_t  max_stationary_gate;                                /**< Configured max stationary gate (2-8). */
     uint8_t  moving_sensitivity[LD2410C_MAX_DISTANCE_GATES];     /**< Per-gate moving sensitivity (0-100). */
     uint8_t  stationary_sensitivity[LD2410C_MAX_DISTANCE_GATES]; /**< Per-gate stationary sensitivity (0-100). */
     uint16_t no_one_duration;                                    /**< No-one timeout in seconds. */
 } ld2410c_params_t;
 
-/** Firmware version information. */
+/**
+ * Firmware version information.
+ *
+ * The module encodes the fields BCD-style, so they read correctly when
+ * printed as hex: major 0x01, minor 0x07, patch 0x22091516 is "V1.07.22091516".
+ */
 typedef struct
 {
     uint16_t firmware_type; /**< Firmware type identifier. */
-    uint8_t  major;         /**< Major version number. */
-    uint8_t  minor;         /**< Minor version number. */
-    uint32_t patch;         /**< Patch/build number. */
+    uint8_t  major;         /**< Major version number (print as hex). */
+    uint8_t  minor;         /**< Minor version number (print as hex). */
+    uint32_t patch;         /**< Build date/time, YYMMDDHH (print as hex). */
 } ld2410c_firmware_ver_t;
 
 /** Auxiliary control (light sensing + OUT pin) configuration. */
@@ -149,8 +164,8 @@ typedef struct
  * UART must be initialized separately before calling any command functions.
  *
  * @param port       UART port number connected to the module.
- * @param timeout_ms Timeout for receiving ACK responses (ms).
- * @return Handle pointer, or NULL on allocation failure.
+ * @param timeout_ms Timeout for receiving an ACK or a data frame (ms), must be > 0.
+ * @return Handle pointer, or NULL on invalid arguments or allocation failure.
  */
 ld2410c_handle_t *ld2410c_init(uart_port_t port, int timeout_ms);
 
@@ -282,13 +297,17 @@ esp_err_t ld2410c_query_noise_detection_status(ld2410c_handle_t *handle, ld2410c
 /**
  * @brief Parse a basic target data frame (normal or engineering mode).
  *
- * Searches the buffer for a valid data frame (header F4 F3 F2 F1)
- * and extracts target state, distances, and energy values.
+ * Searches the buffer for the first complete data frame (header F4 F3 F2 F1,
+ * tail F8 F7 F6 F5) and extracts target state, distances, and energy values.
  *
  * @param frame Raw UART receive buffer.
  * @param len   Number of bytes in the buffer.
  * @param[out] data Parsed target data.
- * @return ESP_OK on success, ESP_ERR_NOT_FOUND if no valid frame found.
+ * @return ESP_OK on success,
+ *         ESP_ERR_NOT_FOUND if the buffer holds no complete frame,
+ *         ESP_ERR_INVALID_SIZE if the frame is too short,
+ *         ESP_ERR_INVALID_RESPONSE if the 0xAA head, 0x55 tail or 0x00 check byte is wrong,
+ *         ESP_ERR_INVALID_ARG if the data type is unknown.
  */
 esp_err_t ld2410c_parse_target_data(const uint8_t *frame, size_t len, ld2410c_target_data_t *data);
 
@@ -301,7 +320,8 @@ esp_err_t ld2410c_parse_target_data(const uint8_t *frame, size_t len, ld2410c_ta
  * @param frame Raw UART receive buffer.
  * @param len   Number of bytes in the buffer.
  * @param[out] data Parsed engineering data.
- * @return ESP_OK on success, ESP_ERR_INVALID_ARG if frame is not engineering mode.
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if frame is not engineering mode,
+ *         otherwise the same errors as ld2410c_parse_target_data().
  */
 esp_err_t ld2410c_parse_engineering_data(const uint8_t *frame, size_t len, ld2410c_engineering_data_t *data);
 
@@ -309,16 +329,23 @@ esp_err_t ld2410c_parse_engineering_data(const uint8_t *frame, size_t len, ld241
  * @brief Read a raw data frame from UART.
  *
  * Blocks until a complete data frame (header F4 F3 F2 F1 ... tail F8 F7 F6 F5)
- * is received, or timeout expires. The raw buffer can then be passed to
- * ld2410c_parse_target_data() or ld2410c_parse_engineering_data().
+ * is received, or the handle's timeout expires (the timeout bounds the whole
+ * call). On success buf holds exactly one frame, starting at buf[0], which can
+ * be passed to ld2410c_parse_target_data() or ld2410c_parse_engineering_data().
+ *
+ * Only that frame is consumed from the UART: bytes after it stay in the UART
+ * driver's RX buffer, so repeated calls return consecutive frames without
+ * losing data to UART fragmentation.
  *
  * @param handle   Driver handle.
- * @param buf      Buffer to receive raw UART data.
- * @param buf_size Size of the buffer (recommend >= 64).
- * @param[out] out_len Number of bytes actually read.
- * @return ESP_OK if a complete data frame was found,
+ * @param buf      Buffer to receive the frame.
+ * @param buf_size Size of the buffer: at least 23 for basic frames, 45 for
+ *                 engineering frames (recommend >= 64). Larger frames are skipped.
+ * @param[out] out_len Length of the frame in buf, 0 on failure. May be NULL.
+ * @return ESP_OK if a complete data frame was read,
  *         ESP_ERR_NOT_FOUND if data was received but no valid frame,
- *         ESP_ERR_TIMEOUT if no data was received.
+ *         ESP_ERR_TIMEOUT if no data was received,
+ *         ESP_ERR_INVALID_SIZE if buf_size is below 23.
  */
 esp_err_t ld2410c_read_data_frame(ld2410c_handle_t *handle, uint8_t *buf, size_t buf_size, size_t *out_len);
 
@@ -350,7 +377,7 @@ esp_err_t ld2410c_configure_detection(       //
  * @brief Read firmware version as a formatted string (e.g. "V1.07.22091516").
  *
  * @param[out] buf      Destination buffer.
- * @param      buf_size Size of the buffer (recommend >= 24).
+ * @param      buf_size Size of the buffer (recommend >= 16).
  */
 esp_err_t ld2410c_get_firmware_string(ld2410c_handle_t *handle, char *buf, size_t buf_size);
 
@@ -372,7 +399,8 @@ esp_err_t ld2410c_factory_reset_and_restart(ld2410c_handle_t *handle);
  * Everyone must leave the detection area before calling this function.
  *
  * @param duration_s       Detection duration in seconds.
- * @param poll_interval_ms Polling interval in milliseconds.
+ * @param poll_interval_ms Polling interval in milliseconds, must be > 0. Capped at
+ *                         the overall timeout (duration_s + 15 s).
  * @return ESP_OK on success, ESP_ERR_TIMEOUT if calibration did not complete.
  */
 esp_err_t ld2410c_auto_calibrate(ld2410c_handle_t *handle, uint16_t duration_s, uint32_t poll_interval_ms);

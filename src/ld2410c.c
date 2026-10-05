@@ -1,5 +1,9 @@
 #include "ld2410c.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "ld2410c";
@@ -47,7 +51,28 @@ enum
 
     ACK_BIT        = 0x0100,
     MAX_FRAME_SIZE = 256,
+
+    FRAME_OVERHEAD      = 10, /* header(4) + len(2) + tail(4) */
+    MIN_REPORT_DATA_LEN = 13, /* data_type(1) + head(1) + target(9) + tail(1) + check(1) */
+    REPORT_HEAD         = 0xAA,
+    REPORT_TAIL         = 0x55,
+    REPORT_CHECK        = 0x00,
+
+    MIN_CONFIG_GATE = 2,
+    MAX_GATE        = LD2410C_MAX_DISTANCE_GATES - 1,
+    ALL_GATES       = 0xFFFF,
+    MAX_SENSITIVITY = 100,
 };
+
+#define CHECK_ARG(cond)                          \
+    do {                                         \
+        if (!(cond)) return ESP_ERR_INVALID_ARG; \
+    } while (0)
+
+static const uint8_t cmd_header[]  = {CMD_HEADER_0, CMD_HEADER_1, CMD_HEADER_2, CMD_HEADER_3};
+static const uint8_t cmd_tail[]    = {CMD_TAIL_0, CMD_TAIL_1, CMD_TAIL_2, CMD_TAIL_3};
+static const uint8_t data_header[] = {DATA_HEADER_0, DATA_HEADER_1, DATA_HEADER_2, DATA_HEADER_3};
+static const uint8_t data_tail[]   = {DATA_TAIL_0, DATA_TAIL_1, DATA_TAIL_2, DATA_TAIL_3};
 
 /* ---------- low-level helpers ---------- */
 
@@ -119,91 +144,110 @@ static size_t build_frame(uint8_t *buf, uint16_t cmd, const uint8_t *value, size
 static esp_err_t send_frame(ld2410c_handle_t *handle, const uint8_t *frame, size_t len)
 {
     int written = uart_write_bytes(handle->uart_port, frame, len);
-    if (written < 0) {
+    if (written != (int)len) {
         return ESP_FAIL;
     }
     return ESP_OK;
 }
 
-static esp_err_t recv_ack(ld2410c_handle_t *handle, uint16_t expected_cmd, uint8_t *out_buf, size_t out_buf_size, size_t *out_len)
+/* Ticks remaining until start + timeout, 0 once the deadline has passed */
+static TickType_t ticks_left(TickType_t start, TickType_t timeout)
 {
-    uint8_t    buf[MAX_FRAME_SIZE];
-    int        total   = 0;
+    TickType_t elapsed = xTaskGetTickCount() - start;
+    return elapsed < timeout ? timeout - elapsed : 0;
+}
+
+static bool read_exact(ld2410c_handle_t *handle, uint8_t *buf, size_t len, TickType_t start, TickType_t timeout)
+{
+    return uart_read_bytes(handle->uart_port, buf, len, ticks_left(start, timeout)) == (int)len;
+}
+
+/*
+ * Read one complete frame (header + len + data + tail) to the start of buf.
+ * Consumes exactly that frame from the UART: bytes preceding the header are
+ * dropped, bytes following the tail stay in the UART driver for the next call.
+ * The whole call is bounded by handle->timeout_ms.
+ */
+static esp_err_t read_frame(ld2410c_handle_t *handle, const uint8_t *header, const uint8_t *tail, uint8_t *buf, size_t buf_size, size_t *frame_len)
+{
+    TickType_t start   = xTaskGetTickCount();
     TickType_t timeout = pdMS_TO_TICKS(handle->timeout_ms);
+    size_t     have    = 0;
+    bool       got_any = false;
 
-    /* Read until we get a complete frame or timeout */
-    while (total < (int)sizeof(buf)) {
-        int n = uart_read_bytes(handle->uart_port, &buf[total], sizeof(buf) - total, timeout);
-        if (n <= 0) {
-            break;
-        }
-        total += n;
+    for (;;) {
+        /* Sync on the header one byte at a time (header bytes are all distinct) */
+        uint8_t b;
+        if (!read_exact(handle, &b, 1, start, timeout)) break;
+        got_any = true;
+        if (b != header[have]) have = 0;
+        if (b != header[have]) continue;
+        buf[have++] = b;
+        if (have < 4) continue;
+        have = 0;
 
-        /* Check if we have a complete frame */
-        if (total >= 10) {
-            /* Find header */
-            int hdr = -1;
-            for (int i = 0; i <= total - 4; i++) {
-                if (buf[i] == CMD_HEADER_0 && buf[i + 1] == CMD_HEADER_1 && buf[i + 2] == CMD_HEADER_2 && buf[i + 3] == CMD_HEADER_3) {
-                    hdr = i;
-                    break;
-                }
-            }
-            if (hdr < 0) continue;
+        if (!read_exact(handle, &buf[4], 2, start, timeout)) break;
+        size_t data_len = get_u16(buf, 4);
+        size_t total    = FRAME_OVERHEAD + data_len;
+        if (total > buf_size) continue; /* corrupted length: resync */
 
-            int remaining = total - hdr;
-            if (remaining < 10) continue;
+        if (!read_exact(handle, &buf[6], data_len + 4, start, timeout)) break;
+        if (memcmp(&buf[6 + data_len], tail, 4) != 0) continue;
 
-            uint16_t data_len   = get_u16(buf, hdr + 4);
-            int      frame_size = 4 + 2 + data_len + 4; /* header + len + data + tail */
-
-            if (remaining < frame_size) continue;
-
-            /* Verify tail */
-            int tail_off = hdr + 4 + 2 + data_len;
-            if (buf[tail_off] != CMD_TAIL_0 || buf[tail_off + 1] != CMD_TAIL_1 || buf[tail_off + 2] != CMD_TAIL_2 || buf[tail_off + 3] != CMD_TAIL_3) {
-                ESP_LOGE(TAG, "Invalid tail in ACK");
-                return ESP_ERR_INVALID_RESPONSE;
-            }
-
-            /* Verify ACK command word */
-            uint16_t ack_cmd = get_u16(buf, hdr + 6);
-            if (ack_cmd != (expected_cmd | ACK_BIT)) {
-                ESP_LOGE(TAG, "Unexpected ACK cmd: 0x%04X (expected 0x%04X)", ack_cmd, expected_cmd | ACK_BIT);
-                return ESP_ERR_INVALID_RESPONSE;
-            }
-
-            /* Check status */
-            uint16_t status = get_u16(buf, hdr + 8);
-            if (status != 0) {
-                ESP_LOGE(TAG, "Command 0x%04X failed, status: %d", expected_cmd, status);
-                return ESP_FAIL;
-            }
-
-            /* Copy return value data (after cmd_word + status) */
-            if (out_buf && out_buf_size > 0) {
-                size_t val_len  = data_len > 4 ? data_len - 4 : 0; /* subtract cmd(2) + status(2) */
-                size_t copy_len = val_len < out_buf_size ? val_len : out_buf_size;
-                /* Guard against reading past received data */
-                if (hdr + 10 + copy_len > (size_t)total) {
-                    ESP_LOGE(TAG, "ACK data exceeds buffer");
-                    return ESP_ERR_INVALID_RESPONSE;
-                }
-                memcpy(out_buf, &buf[hdr + 10], copy_len);
-                if (out_len) *out_len = copy_len;
-            }
-
-            return ESP_OK;
-        }
+        *frame_len = total;
+        return ESP_OK;
     }
 
-    ESP_LOGE(TAG, "Timeout waiting for ACK to cmd 0x%04X", expected_cmd);
-    return ESP_ERR_TIMEOUT;
+    return got_any ? ESP_ERR_NOT_FOUND : ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t recv_ack(ld2410c_handle_t *handle, uint16_t expected_cmd, uint8_t *out_buf, size_t out_buf_size, size_t *out_len)
+{
+    uint8_t buf[MAX_FRAME_SIZE];
+    size_t  frame_len;
+
+    if (read_frame(handle, cmd_header, cmd_tail, buf, sizeof(buf), &frame_len) != ESP_OK) {
+        ESP_LOGE(TAG, "Timeout waiting for ACK to cmd 0x%04X", expected_cmd);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /* ACK data is at least cmd(2) + status(2) */
+    uint16_t data_len = get_u16(buf, 4);
+    if (data_len < 4) {
+        ESP_LOGE(TAG, "ACK too short: %u", data_len);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    /* Verify ACK command word */
+    uint16_t ack_cmd = get_u16(buf, 6);
+    if (ack_cmd != (expected_cmd | ACK_BIT)) {
+        ESP_LOGE(TAG, "Unexpected ACK cmd: 0x%04X (expected 0x%04X)", ack_cmd, expected_cmd | ACK_BIT);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    /* Check status */
+    uint16_t status = get_u16(buf, 8);
+    if (status != 0) {
+        ESP_LOGE(TAG, "Command 0x%04X failed, status: %d", expected_cmd, status);
+        return ESP_FAIL;
+    }
+
+    /* Copy return value data (after cmd_word + status) */
+    if (out_buf && out_buf_size > 0) {
+        size_t val_len  = data_len - 4;
+        size_t copy_len = val_len < out_buf_size ? val_len : out_buf_size;
+        memcpy(out_buf, &buf[10], copy_len);
+        if (out_len) *out_len = copy_len;
+    }
+
+    return ESP_OK;
 }
 
 static esp_err_t send_command(ld2410c_handle_t *handle, uint16_t cmd, const uint8_t *value, size_t value_len, uint8_t *ret_buf, size_t ret_buf_size,
                               size_t *ret_len)
 {
+    CHECK_ARG(handle);
+
     uint8_t frame[MAX_FRAME_SIZE];
     size_t  frame_len = build_frame(frame, cmd, value, value_len);
 
@@ -227,6 +271,10 @@ static esp_err_t send_simple_command(ld2410c_handle_t *handle, uint16_t cmd)
 
 ld2410c_handle_t *ld2410c_init(uart_port_t port, int timeout_ms)
 {
+    if ((unsigned)port >= UART_NUM_MAX || timeout_ms <= 0) {
+        return NULL;
+    }
+
     ld2410c_handle_t *handle = malloc(sizeof(ld2410c_handle_t));
     if (!handle) {
         return NULL;
@@ -258,6 +306,9 @@ esp_err_t ld2410c_end_config(ld2410c_handle_t *handle)
 
 esp_err_t ld2410c_set_max_gate_and_duration(ld2410c_handle_t *handle, uint8_t max_moving_gate, uint8_t max_stationary_gate, uint16_t no_one_duration_s)
 {
+    CHECK_ARG(max_moving_gate >= MIN_CONFIG_GATE && max_moving_gate <= MAX_GATE);
+    CHECK_ARG(max_stationary_gate >= MIN_CONFIG_GATE && max_stationary_gate <= MAX_GATE);
+
     uint8_t value[18];
     /* max motion distance gate word + value */
     size_t pos = put_u16(value, 0, 0x0000);
@@ -274,13 +325,15 @@ esp_err_t ld2410c_set_max_gate_and_duration(ld2410c_handle_t *handle, uint8_t ma
 
 esp_err_t ld2410c_read_params(ld2410c_handle_t *handle, ld2410c_params_t *params)
 {
+    CHECK_ARG(params);
+
     uint8_t   ret[64];
     size_t    ret_len = 0;
     esp_err_t err     = send_command(handle, CMD_READ_PARAMS, NULL, 0, ret, sizeof(ret), &ret_len);
     if (err != ESP_OK) return err;
 
     /* ret[0] = 0xAA header, ret[1] = max distance gate N */
-    if (ret_len < 4 || ret[0] != 0xAA) {
+    if (ret_len < 4 || ret[0] != 0xAA || ret[1] > MAX_GATE) {
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -294,10 +347,12 @@ esp_err_t ld2410c_read_params(ld2410c_handle_t *handle, ld2410c_params_t *params
         return ESP_ERR_INVALID_SIZE;
     }
 
-    for (int i = 0; i < num_gates && i < LD2410C_MAX_DISTANCE_GATES; i++) {
+    memset(params->moving_sensitivity, 0, sizeof(params->moving_sensitivity));
+    memset(params->stationary_sensitivity, 0, sizeof(params->stationary_sensitivity));
+    for (int i = 0; i < num_gates; i++) {
         params->moving_sensitivity[i] = ret[4 + i];
     }
-    for (int i = 0; i < num_gates && i < LD2410C_MAX_DISTANCE_GATES; i++) {
+    for (int i = 0; i < num_gates; i++) {
         params->stationary_sensitivity[i] = ret[4 + num_gates + i];
     }
     params->no_one_duration = get_u16(ret, 4 + num_gates + num_gates);
@@ -307,6 +362,9 @@ esp_err_t ld2410c_read_params(ld2410c_handle_t *handle, ld2410c_params_t *params
 
 esp_err_t ld2410c_set_gate_sensitivity(ld2410c_handle_t *handle, uint16_t gate, uint8_t moving_sensitivity, uint8_t stationary_sensitivity)
 {
+    CHECK_ARG(gate <= MAX_GATE || gate == ALL_GATES);
+    CHECK_ARG(moving_sensitivity <= MAX_SENSITIVITY && stationary_sensitivity <= MAX_SENSITIVITY);
+
     uint8_t value[18];
     size_t pos = put_u16(value, 0, 0x0000);
     pos = put_u32(value, pos, gate);
@@ -320,7 +378,7 @@ esp_err_t ld2410c_set_gate_sensitivity(ld2410c_handle_t *handle, uint16_t gate, 
 
 esp_err_t ld2410c_set_all_gate_sensitivity(ld2410c_handle_t *handle, uint8_t moving_sensitivity, uint8_t stationary_sensitivity)
 {
-    return ld2410c_set_gate_sensitivity(handle, 0xFFFF, moving_sensitivity, stationary_sensitivity);
+    return ld2410c_set_gate_sensitivity(handle, ALL_GATES, moving_sensitivity, stationary_sensitivity);
 }
 
 esp_err_t ld2410c_enable_engineering_mode(ld2410c_handle_t *handle)
@@ -335,6 +393,8 @@ esp_err_t ld2410c_disable_engineering_mode(ld2410c_handle_t *handle)
 
 esp_err_t ld2410c_read_firmware_version(ld2410c_handle_t *handle, ld2410c_firmware_ver_t *ver)
 {
+    CHECK_ARG(ver);
+
     uint8_t   ret[8];
     size_t    ret_len = 0;
     esp_err_t err     = send_command(handle, CMD_READ_FW_VER, NULL, 0, ret, sizeof(ret), &ret_len);
@@ -342,9 +402,10 @@ esp_err_t ld2410c_read_firmware_version(ld2410c_handle_t *handle, ld2410c_firmwa
 
     if (ret_len < 8) return ESP_ERR_INVALID_SIZE;
 
+    /* type(2) + version word(2, LE: minor then major) + build(4, LE), all BCD-style */
     ver->firmware_type = get_u16(ret, 0);
-    ver->major         = ret[2];
-    ver->minor         = ret[3];
+    ver->minor         = ret[2];
+    ver->major         = ret[3];
     ver->patch         = get_u32(ret, 4);
 
     return ESP_OK;
@@ -352,6 +413,8 @@ esp_err_t ld2410c_read_firmware_version(ld2410c_handle_t *handle, ld2410c_firmwa
 
 esp_err_t ld2410c_set_baud_rate(ld2410c_handle_t *handle, ld2410c_baud_t baud)
 {
+    CHECK_ARG(baud >= LD2410C_BAUD_9600 && baud <= LD2410C_BAUD_460800);
+
     uint8_t value[2];
     size_t pos = put_u16(value, 0, (uint16_t)baud);
     return send_command(handle, CMD_SET_BAUD, value, pos, NULL, 0, NULL);
@@ -376,26 +439,32 @@ esp_err_t ld2410c_set_bluetooth(ld2410c_handle_t *handle, bool enable)
 
 esp_err_t ld2410c_get_mac_address(ld2410c_handle_t *handle, uint8_t mac[6])
 {
+    CHECK_ARG(mac);
+
     uint8_t   value[2] = {0x01, 0x00};
     uint8_t   ret[8];
     size_t    ret_len = 0;
     esp_err_t err     = send_command(handle, CMD_GET_MAC, value, sizeof(value), ret, sizeof(ret), &ret_len);
     if (err != ESP_OK) return err;
 
-    if (ret_len < 7) return ESP_ERR_INVALID_SIZE;
+    /* Return value is the 6-byte MAC (big-endian) right after the ACK status */
+    if (ret_len < 6) return ESP_ERR_INVALID_SIZE;
 
-    /* ret[0] = type (0x00), ret[1..6] = MAC (big-endian) */
-    memcpy(mac, &ret[1], 6);
+    memcpy(mac, ret, 6);
     return ESP_OK;
 }
 
 esp_err_t ld2410c_set_bluetooth_password(ld2410c_handle_t *handle, const char password[6])
 {
+    CHECK_ARG(password);
+
     return send_command(handle, CMD_SET_BT_PASS, (const uint8_t *)password, 6, NULL, 0, NULL);
 }
 
 esp_err_t ld2410c_set_distance_resolution(ld2410c_handle_t *handle, ld2410c_resolution_t res)
 {
+    CHECK_ARG((unsigned)res <= LD2410C_RESOLUTION_020M);
+
     uint8_t value[2];
     size_t pos = put_u16(value, 0, (uint16_t)res);
     return send_command(handle, CMD_SET_RESOLUTION, value, pos, NULL, 0, NULL);
@@ -403,6 +472,8 @@ esp_err_t ld2410c_set_distance_resolution(ld2410c_handle_t *handle, ld2410c_reso
 
 esp_err_t ld2410c_get_distance_resolution(ld2410c_handle_t *handle, ld2410c_resolution_t *res)
 {
+    CHECK_ARG(res);
+
     uint8_t   ret[4];
     size_t    ret_len = 0;
     esp_err_t err     = send_command(handle, CMD_GET_RESOLUTION, NULL, 0, ret, sizeof(ret), &ret_len);
@@ -415,6 +486,10 @@ esp_err_t ld2410c_get_distance_resolution(ld2410c_handle_t *handle, ld2410c_reso
 
 esp_err_t ld2410c_set_aux_control(ld2410c_handle_t *handle, const ld2410c_aux_ctrl_t *ctrl)
 {
+    CHECK_ARG(ctrl);
+    CHECK_ARG((unsigned)ctrl->mode <= LD2410C_LIGHT_CTRL_ABOVE_THRESH);
+    CHECK_ARG((unsigned)ctrl->out_default <= LD2410C_OUT_DEFAULT_HIGH);
+
     uint8_t value[4] = {
         (uint8_t)ctrl->mode,
         ctrl->threshold,
@@ -426,6 +501,8 @@ esp_err_t ld2410c_set_aux_control(ld2410c_handle_t *handle, const ld2410c_aux_ct
 
 esp_err_t ld2410c_get_aux_control(ld2410c_handle_t *handle, ld2410c_aux_ctrl_t *ctrl)
 {
+    CHECK_ARG(ctrl);
+
     uint8_t   ret[4];
     size_t    ret_len = 0;
     esp_err_t err     = send_command(handle, CMD_GET_AUX_CTRL, NULL, 0, ret, sizeof(ret), &ret_len);
@@ -447,6 +524,8 @@ esp_err_t ld2410c_start_noise_detection(ld2410c_handle_t *handle, uint16_t durat
 
 esp_err_t ld2410c_query_noise_detection_status(ld2410c_handle_t *handle, ld2410c_noise_status_t *status)
 {
+    CHECK_ARG(status);
+
     uint8_t   ret[4];
     size_t    ret_len = 0;
     esp_err_t err     = send_command(handle, CMD_QUERY_NOISE_DET, NULL, 0, ret, sizeof(ret), &ret_len);
@@ -458,9 +537,6 @@ esp_err_t ld2410c_query_noise_detection_status(ld2410c_handle_t *handle, ld2410c
 }
 
 /* ---------- data frame parsing ---------- */
-
-static const uint8_t data_header[] = {DATA_HEADER_0, DATA_HEADER_1, DATA_HEADER_2, DATA_HEADER_3};
-static const uint8_t data_tail[]   = {DATA_TAIL_0, DATA_TAIL_1, DATA_TAIL_2, DATA_TAIL_3};
 
 static int find_data_frame(const uint8_t *buf, size_t len, size_t *frame_start, size_t *frame_len)
 {
@@ -480,70 +556,90 @@ static int find_data_frame(const uint8_t *buf, size_t len, size_t *frame_start, 
     return -1;
 }
 
-esp_err_t ld2410c_parse_target_data(const uint8_t *frame, size_t len, ld2410c_target_data_t *data)
+/*
+ * Locate a data frame in buf and validate its intra-frame envelope
+ * (minimum length, 0xAA head, 0x55 tail, 0x00 check). On success *d points
+ * at the data type byte and *data_len holds the intra-frame data length.
+ */
+static esp_err_t find_report(const uint8_t *buf, size_t len, const uint8_t **d, uint16_t *data_len)
 {
     size_t start, flen;
-    if (find_data_frame(frame, len, &start, &flen) != 0) {
+    if (find_data_frame(buf, len, &start, &flen) != 0) {
         return ESP_ERR_NOT_FOUND;
     }
 
-    const uint8_t *d        = &frame[start + 6]; /* skip header(4) + length(2) */
-    uint16_t       data_len = get_u16(frame, start + 4);
+    *d        = &buf[start + 6]; /* skip header(4) + length(2) */
+    *data_len = get_u16(buf, start + 4);
 
-    /* data_type(1) + head(1) + target(9) + tail(1) + check(1) = 13 */
-    if (data_len < 13) return ESP_ERR_INVALID_SIZE;
+    if (*data_len < MIN_REPORT_DATA_LEN) return ESP_ERR_INVALID_SIZE;
 
-    uint8_t data_type = d[0];
-    if (data_type != 0x02 && data_type != 0x01) {
-        return ESP_ERR_INVALID_ARG;
+    if ((*d)[1] != REPORT_HEAD || (*d)[*data_len - 2] != REPORT_TAIL || (*d)[*data_len - 1] != REPORT_CHECK) {
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
-    /* d[1] = 0xAA head */
+    return ESP_OK;
+}
+
+static void parse_basic(const uint8_t *d, ld2410c_target_data_t *data)
+{
     data->state                  = (ld2410c_target_state_t)d[2];
     data->moving_distance_cm     = get_u16(d, 3);
     data->moving_energy          = d[5];
     data->stationary_distance_cm = get_u16(d, 6);
     data->stationary_energy      = d[8];
     data->detection_distance_cm  = get_u16(d, 9);
+}
+
+esp_err_t ld2410c_parse_target_data(const uint8_t *frame, size_t len, ld2410c_target_data_t *data)
+{
+    CHECK_ARG(frame && data);
+
+    const uint8_t *d;
+    uint16_t       data_len;
+    esp_err_t      err = find_report(frame, len, &d, &data_len);
+    if (err != ESP_OK) return err;
+
+    uint8_t data_type = d[0];
+    if (data_type != 0x02 && data_type != 0x01) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    parse_basic(d, data);
 
     return ESP_OK;
 }
 
 esp_err_t ld2410c_parse_engineering_data(const uint8_t *frame, size_t len, ld2410c_engineering_data_t *data)
 {
-    size_t start, flen;
-    if (find_data_frame(frame, len, &start, &flen) != 0) {
-        return ESP_ERR_NOT_FOUND;
-    }
+    CHECK_ARG(frame && data);
 
-    const uint8_t *d        = &frame[start + 6];
-    uint16_t       data_len = get_u16(frame, start + 4);
+    const uint8_t *d;
+    uint16_t       data_len;
+    esp_err_t      err = find_report(frame, len, &d, &data_len);
+    if (err != ESP_OK) return err;
 
     if (d[0] != 0x01) {
         return ESP_ERR_INVALID_ARG; /* not engineering mode data */
     }
 
-    /* Parse basic target data first */
-    data->basic.state                  = (ld2410c_target_state_t)d[2];
-    data->basic.moving_distance_cm     = get_u16(d, 3);
-    data->basic.moving_energy          = d[5];
-    data->basic.stationary_distance_cm = get_u16(d, 6);
-    data->basic.stationary_energy      = d[8];
-    data->basic.detection_distance_cm  = get_u16(d, 9);
-
-    /* Engineering extra data starts at d[11] */
+    /* Engineering extra data starts at d[11]; tail(1) + check(1) close the data */
     size_t off = 11;
-    if (data_len < off + 2) return ESP_ERR_INVALID_SIZE;
+    if (data_len < off + 2 + 2) return ESP_ERR_INVALID_SIZE;
 
-    data->max_moving_gate     = d[off++];
-    data->max_stationary_gate = d[off++];
-
-    uint8_t num_gates = data->max_moving_gate + 1;
-    if (num_gates > LD2410C_MAX_DISTANCE_GATES) {
-        num_gates = LD2410C_MAX_DISTANCE_GATES;
+    uint8_t max_moving_gate     = d[off++];
+    uint8_t max_stationary_gate = d[off++];
+    if (max_moving_gate > MAX_GATE || max_stationary_gate > MAX_GATE) {
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
-    if (data_len < off + num_gates * 2 + 2) return ESP_ERR_INVALID_SIZE;
+    /* moving[N+1] + stationary[N+1] + photosensitive(1) + out(1) + tail(1) + check(1) */
+    uint8_t num_gates = max_moving_gate + 1;
+    if (data_len < off + num_gates * 2 + 2 + 2) return ESP_ERR_INVALID_SIZE;
+
+    memset(data, 0, sizeof(*data));
+    parse_basic(d, &data->basic);
+    data->max_moving_gate     = max_moving_gate;
+    data->max_stationary_gate = max_stationary_gate;
 
     for (int i = 0; i < num_gates; i++) {
         data->moving_gate_energy[i] = d[off++];
@@ -560,24 +656,16 @@ esp_err_t ld2410c_parse_engineering_data(const uint8_t *frame, size_t len, ld241
 
 esp_err_t ld2410c_read_data_frame(ld2410c_handle_t *handle, uint8_t *buf, size_t buf_size, size_t *out_len)
 {
-    int        total   = 0;
-    TickType_t timeout = pdMS_TO_TICKS(handle->timeout_ms);
+    CHECK_ARG(handle && buf);
+    if (out_len) *out_len = 0;
+    if (buf_size < FRAME_OVERHEAD + MIN_REPORT_DATA_LEN) return ESP_ERR_INVALID_SIZE;
 
-    while ((size_t)total < buf_size) {
-        int n = uart_read_bytes(handle->uart_port, &buf[total], buf_size - total, timeout);
-        if (n <= 0) break;
-        total += n;
+    size_t    frame_len;
+    esp_err_t err = read_frame(handle, data_header, data_tail, buf, buf_size, &frame_len);
+    if (err != ESP_OK) return err;
 
-        /* Look for a complete data frame */
-        size_t frame_start, frame_len;
-        if (find_data_frame(buf, total, &frame_start, &frame_len) == 0) {
-            if (out_len) *out_len = total;
-            return ESP_OK;
-        }
-    }
-
-    if (out_len) *out_len = total;
-    return (total > 0) ? ESP_ERR_NOT_FOUND : ESP_ERR_TIMEOUT;
+    if (out_len) *out_len = frame_len;
+    return ESP_OK;
 }
 
 /* ---------- high-level functions ---------- */
@@ -623,6 +711,8 @@ esp_err_t ld2410c_configure_detection(ld2410c_handle_t *handle,
 
 esp_err_t ld2410c_get_firmware_string(ld2410c_handle_t *handle, char *buf, size_t buf_size)
 {
+    CHECK_ARG(buf && buf_size > 0);
+
     CONFIG_BEGIN(handle);
 
     ld2410c_firmware_ver_t ver;
@@ -634,8 +724,8 @@ esp_err_t ld2410c_get_firmware_string(ld2410c_handle_t *handle, char *buf, size_
 
     CONFIG_END(handle);
 
-    /* Format: V<major>.<minor>.<patch_as_decimal> e.g. "V1.07.22091516" */
-    snprintf(buf, buf_size, "V%u.%02u.%08lu",
+    /* Version fields are BCD-style, so print them as hex: e.g. "V1.07.22091516" */
+    snprintf(buf, buf_size, "V%X.%02X.%08lX",
              ver.major, ver.minor, (unsigned long)ver.patch);
     return ESP_OK;
 }
@@ -644,6 +734,8 @@ esp_err_t ld2410c_get_full_config(ld2410c_handle_t *handle,
                                   ld2410c_params_t *params,
                                   ld2410c_resolution_t *resolution)
 {
+    CHECK_ARG(params && resolution);
+
     CONFIG_BEGIN(handle);
 
     esp_err_t err = ld2410c_read_params(handle, params);
@@ -679,6 +771,8 @@ esp_err_t ld2410c_factory_reset_and_restart(ld2410c_handle_t *handle)
 
 esp_err_t ld2410c_auto_calibrate(ld2410c_handle_t *handle, uint16_t duration_s, uint32_t poll_interval_ms)
 {
+    CHECK_ARG(poll_interval_ms > 0);
+
     CONFIG_BEGIN(handle);
 
     esp_err_t err = ld2410c_start_noise_detection(handle, duration_s);
@@ -689,10 +783,14 @@ esp_err_t ld2410c_auto_calibrate(ld2410c_handle_t *handle, uint16_t duration_s, 
 
     CONFIG_END(handle);
 
+    /* Timeout: detection duration + 15s headroom (10s startup + margin) */
+    uint32_t total_ms = ((uint32_t)duration_s + 15) * 1000;
+    if (poll_interval_ms > total_ms) poll_interval_ms = total_ms;
+    uint32_t max_polls = total_ms / poll_interval_ms + (total_ms % poll_interval_ms != 0);
+
     /* Poll until detection completes */
     TickType_t poll_ticks = pdMS_TO_TICKS(poll_interval_ms);
-    /* Timeout: detection duration + 15s headroom (10s startup + margin) */
-    uint32_t max_polls = ((uint32_t)duration_s + 15) * 1000 / poll_interval_ms;
+    if (poll_ticks == 0) poll_ticks = 1;
 
     for (uint32_t i = 0; i < max_polls; i++) {
         vTaskDelay(poll_ticks);

@@ -17,8 +17,9 @@ ESP-IDF driver component for the HLK-LD2410C human presence sensing radar module
 
 ## Hardware Specifications
 
+- **Power Supply**: 5 V, supply capability above 200 mA (not the 3.3 V rail)
 - **Default UART Settings**: 256000 baud, 8N1, no flow control
-- **Interface**: UART communication
+- **Interface**: UART communication, 3.3 V logic levels
 - **Detection Range**: Up to 6 meters (configurable via distance gates)
 - **OUT Pin**: Configurable presence detection signal
 
@@ -27,14 +28,14 @@ ESP-IDF driver component for the HLK-LD2410C human presence sensing radar module
 Add this component to your ESP-IDF project using the IDF Component Manager:
 
 ```bash
-idf.py add-dependency "jef-sure/esp32-component-ld2410c"
+idf.py add-dependency "jef-sure/ld2410c^0.1.0"
 ```
 
 Or manually add to your project's `idf_component.yml`:
 
 ```yaml
 dependencies:
-  jef-sure/esp32-component-ld2410c: "^0.0.1"
+  jef-sure/ld2410c: "^0.1.0"
 ```
 
 ## Usage Example
@@ -61,10 +62,14 @@ ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &uart_config));
 ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, TX_PIN, RX_PIN,
                               UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-// Initialize LD2410C handle
+// Initialize LD2410C handle (timeout bounds each ACK wait and each frame read)
 ld2410c_handle_t *ld = ld2410c_init(UART_NUM_1, 1000);
+if (ld == NULL) {
+    ESP_LOGE(TAG, "ld2410c_init failed");
+    return;
+}
 
-// Read and parse target data
+// Read one data frame and parse it
 uint8_t buf[64];
 size_t len;
 if (ld2410c_read_data_frame(ld, buf, sizeof(buf), &len) == ESP_OK) {
@@ -89,6 +94,35 @@ ld2410c_deinit(&ld);
 ```
 
 See the [example](examples/sample) for a complete working demonstration.
+
+## Upgrading from 0.0.x
+
+Version 0.1.0 keeps the API signatures but changes how several calls behave —
+most visibly `ld2410c_read_data_frame()`, which now returns exactly one frame
+at the start of the buffer, the firmware version fields, argument validation,
+and command timing. See "Behavior changes" in [CHANGES.md](CHANGES.md) before
+upgrading.
+
+## Thread Safety
+
+The driver does no locking. Every command function flushes the UART RX buffer
+and then reads its ACK from the same UART, so:
+
+- do not call command functions from several tasks at once;
+- do not run a command while another task is inside `ld2410c_read_data_frame()`
+  (or reads that UART directly) — the two would steal each other's bytes.
+
+Use the handle from a single task, or guard all calls with your own mutex. The
+`ld2410c_parse_*()` functions work only on the buffer they are given and are
+safe to call from any task.
+
+## Error Handling
+
+All functions return `ESP_ERR_INVALID_ARG` for a NULL handle, a NULL output
+pointer, or an out-of-range value (max gates 2-8, gate index 0-8, sensitivity
+0-100, unknown enum values) without sending anything to the module. The parsers
+verify the frame's `0xAA` head, `0x55` tail and `0x00` check byte and return
+`ESP_ERR_INVALID_RESPONSE` for corrupted frames.
 
 ## API Documentation
 
@@ -122,13 +156,26 @@ Automatically handle configuration mode:
 - `ld2410c_auto_calibrate()` - Run noise calibration and block until complete
 
 ### Data Frame Reader & Parsers
-- `ld2410c_read_data_frame()` - Read a raw data frame from UART
+- `ld2410c_read_data_frame()` - Read exactly one raw data frame from UART
 - `ld2410c_parse_target_data()` - Parse basic target detection data
 - `ld2410c_parse_engineering_data()` - Parse detailed engineering mode data
 
+## Testing
+
+Host unit tests (protocol examples, malformed frames, fragmented UART input,
+parameter boundaries) run on the development machine against a mocked UART,
+no hardware or ESP-IDF needed:
+
+```bash
+make -C test/host
+```
+
+Run it from a plain shell: an activated ESP-IDF environment puts the ULP
+toolchain's `ld` first on `PATH`, which breaks the host link step.
+
 ## Requirements
 
-- ESP-IDF v5.0 or higher
+- ESP-IDF v5.3 or higher
 - UART peripheral
 - GPIO for OUT pin monitoring (optional)
 
