@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4 — 2026-10-06
+
+Documentation only; the driver code is the same as in 0.1.2.
+
+### Changed
+
+- README: the install instructions name the current version.
+
 ## 0.1.3 — 2026-10-06
 
 Documentation only; the driver code is the same as in 0.1.2.
