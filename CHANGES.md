@@ -6,8 +6,8 @@ Documentation only; the driver code is the same as in 0.1.2.
 
 ### Fixed
 
-- README: the install instructions named `^0.1.0`, which also matches a version
-  without the functions listed in the API section; they now name `^0.1.2`.
+- README: the install instructions named `^0.1.0`; they now name the current
+  version.
 - README: the usage example set the stationary sensitivity of gate 0, which the
   module does not let you set (gates 0 and 1). It now configures gate 3, checks
   the results of the calls and uses `ld2410c_target_is_present()`.

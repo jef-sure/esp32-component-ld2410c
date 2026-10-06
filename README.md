@@ -31,14 +31,14 @@ See [docs/module.md](docs/module.md) for pins, mounting and Bluetooth.
 Add this component to your ESP-IDF project using the IDF Component Manager:
 
 ```bash
-idf.py add-dependency "jef-sure/ld2410c^0.1.2"
+idf.py add-dependency "jef-sure/ld2410c^0.1.3"
 ```
 
 Or manually add to your project's `idf_component.yml`:
 
 ```yaml
 dependencies:
-  jef-sure/ld2410c: "^0.1.2"
+  jef-sure/ld2410c: "^0.1.3"
 ```
 
 ## Usage Example
