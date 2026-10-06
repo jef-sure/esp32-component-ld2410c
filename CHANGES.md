@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.3 — 2026-10-06
+
+Documentation only; the driver code is the same as in 0.1.2.
+
+### Fixed
+
+- README: the install instructions named `^0.1.0`, which also matches a version
+  without the functions listed in the API section; they now name `^0.1.2`.
+- README: the usage example set the stationary sensitivity of gate 0, which the
+  module does not let you set (gates 0 and 1). It now configures gate 3, checks
+  the results of the calls and uses `ld2410c_target_is_present()`.
+- README: "three levels of API" over four groups of functions; "full
+  implementation" of the protocol although the Bluetooth-only command `0x00A8`
+  is not implemented.
+- Sample: "6 gates" for a max gate of 6, which is gates 0 to 6.
+
+### Added
+
+- README: the error codes the command functions and `ld2410c_read_data_frame()`
+  return, short descriptions for all functions in the API list, average current
+  and detection angle.
+
 ## 0.1.2 — 2026-10-06
 
 ### Fixed

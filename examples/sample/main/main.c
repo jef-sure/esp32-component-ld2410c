@@ -183,11 +183,11 @@ void app_main(void)
     /* Print current configuration */
     print_config();
 
-    /* Configure: max 6 gates (~4.5m at 0.75m resolution), 10s no-one timeout,
+    /* Configure: max gate 6 (~4.5m at 0.75m resolution), 10s no-one timeout,
        sensitivity 40 for moving, 30 for stationary */
     esp_err_t err = ld2410c_configure_detection(s_ld, 6, 6, 10, 40, 30);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Detection configured: 6 gates, 10s timeout, sens 40/30");
+        ESP_LOGI(TAG, "Detection configured: max gate 6, 10s timeout, sens 40/30");
     } else {
         ESP_LOGE(TAG, "Failed to configure detection: %s", esp_err_to_name(err));
     }
