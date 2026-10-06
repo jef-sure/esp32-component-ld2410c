@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.1.1 — 2026-10-06
+
+### Fixed
+
+- **`ld2410c_parse_engineering_data()` sized both gate arrays from the max
+  moving gate.** The module sends the energies of all nine gates whatever
+  maximum gate is configured, so with fewer than 8 gates configured (the sample
+  uses 6) the stationary energies, the photosensitive value and the OUT pin
+  state were read from the wrong bytes without any error. The number of gates
+  is now taken from the frame length (`17 + 2 * gates` bytes of data), so frames
+  with 1 to 9 gates parse correctly; other lengths return
+  `ESP_ERR_INVALID_SIZE`. The `max_moving_gate` / `max_stationary_gate` fields
+  still report the values from the frame.
+- **A damaged frame no longer swallows the frames behind it.** After a frame
+  with a bad tail or a bad length field, `ld2410c_read_data_frame()` and the ACK
+  reader dropped everything they had read for that frame, including the start
+  of the next one. Now only the first byte is dropped and the rest is scanned
+  again. The handle keeps the bytes read ahead (`rx_pending`); they are
+  discarded when a command flushes the UART input.
+- A timeout in the middle of a frame no longer discards what was received: the
+  next `ld2410c_read_data_frame()` call continues with it.
+- A handle timeout shorter than one RTOS tick (for example 5 ms at 100 Hz) made
+  every read non-blocking, so every command failed with `ESP_ERR_TIMEOUT`. It is
+  now at least one tick.
+- A late ACK of an earlier command in front of the expected one no longer fails
+  the command. It is skipped; if the expected ACK never arrives the call ends
+  after the timeout with `ESP_ERR_INVALID_RESPONSE` (an ACK for another command
+  was seen) or `ESP_ERR_TIMEOUT`.
+- The high-level wrappers leave config mode more reliably, because a module
+  stuck in config mode stops sending data frames: `end_config` is retried once
+  when it fails, and sent after an `enable_config` that timed out (its ACK may
+  have been lost). A wrapper that fails because of an absent module therefore
+  waits for one more timeout.
+- `ld2410c_auto_calibrate()` returns the error of the status query instead of
+  the one from leaving config mode.
+
+### Changed
+
+- Frames longer than 256 bytes are skipped by `ld2410c_read_data_frame()`
+  whatever the buffer size (the module sends none; engineering frames are 45
+  bytes).
+- `ld2410c_handle_t` has two more fields, `rx_pending` and `rx_pending_len`.
+  They are private; create handles with `ld2410c_init()` as before.
+- Documented `ESP_FAIL` as a result of `ld2410c_auto_calibrate()`.
+
+### Added
+
+- Host tests for engineering frames with 1 to 9 gates and a configured max gate
+  of 6, a frame that lost a byte, a length field that is too large, partial
+  frames, stale ACKs, a sub-tick timeout, leaving config mode and calibration
+  errors. The mock clock can model a tick longer than 1 ms.
+- The sample can switch the module to engineering mode and log the per-gate
+  energies (`EXAMPLE_ENGINEERING_MODE`).
+
 ## 0.1.0 — 2026-10-05
 
 ### Behavior changes (read before upgrading from 0.0.x)

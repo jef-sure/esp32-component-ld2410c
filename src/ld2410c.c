@@ -54,6 +54,10 @@ enum
 
     FRAME_OVERHEAD      = 10, /* header(4) + len(2) + tail(4) */
     MIN_REPORT_DATA_LEN = 13, /* data_type(1) + head(1) + target(9) + tail(1) + check(1) */
+    /* Engineering data length without the per-gate bytes: basic part(11) + max gates(2)
+       + photosensitive(1) + out(1) + tail(1) + check(1). Each gate adds moving(1) + stationary(1). */
+    ENG_DATA_OVERHEAD = 17,
+    MIN_ENG_GATES     = 1,
     REPORT_HEAD         = 0xAA,
     REPORT_TAIL         = 0x55,
     REPORT_CHECK        = 0x00,
@@ -157,42 +161,108 @@ static TickType_t ticks_left(TickType_t start, TickType_t timeout)
     return elapsed < timeout ? timeout - elapsed : 0;
 }
 
-static bool read_exact(ld2410c_handle_t *handle, uint8_t *buf, size_t len, TickType_t start, TickType_t timeout)
+/* Handle timeout in ticks, at least one: a sub-tick timeout must not make every read non-blocking */
+static TickType_t handle_timeout_ticks(const ld2410c_handle_t *handle)
 {
-    return uart_read_bytes(handle->uart_port, buf, len, ticks_left(start, timeout)) == (int)len;
+    TickType_t ticks = pdMS_TO_TICKS(handle->timeout_ms);
+    return ticks > 0 ? ticks : 1;
+}
+
+/* Put bytes back at the front of the stream so the next read sees them first */
+static void rx_unread(ld2410c_handle_t *handle, const uint8_t *data, size_t len)
+{
+    /* A frame never exceeds MAX_FRAME_SIZE, so the pending bytes always fit; clamp anyway */
+    size_t room = LD2410C_RX_PENDING_SIZE - handle->rx_pending_len;
+    if (len > room) len = room;
+    memmove(&handle->rx_pending[len], handle->rx_pending, handle->rx_pending_len);
+    memcpy(handle->rx_pending, data, len);
+    handle->rx_pending_len += len;
+}
+
+/* Drop everything received so far, including the bytes put back by rx_unread() */
+static void rx_flush(ld2410c_handle_t *handle)
+{
+    handle->rx_pending_len = 0;
+    uart_flush_input(handle->uart_port);
 }
 
 /*
- * Read one complete frame (header + len + data + tail) to the start of buf.
- * Consumes exactly that frame from the UART: bytes preceding the header are
- * dropped, bytes following the tail stay in the UART driver for the next call.
- * The whole call is bounded by handle->timeout_ms.
+ * Read up to len bytes: first the ones put back by rx_unread(), then from the UART until the
+ * deadline. Returns how many bytes were read, which is less than len only on timeout.
+ * Sets *from_uart when at least one byte came from the UART itself (not from the put-back ones).
  */
-static esp_err_t read_frame(ld2410c_handle_t *handle, const uint8_t *header, const uint8_t *tail, uint8_t *buf, size_t buf_size, size_t *frame_len)
+static size_t read_some(ld2410c_handle_t *handle, uint8_t *buf, size_t len, TickType_t start, TickType_t timeout, bool *from_uart)
 {
-    TickType_t start   = xTaskGetTickCount();
-    TickType_t timeout = pdMS_TO_TICKS(handle->timeout_ms);
-    size_t     have    = 0;
-    bool       got_any = false;
+    size_t got = 0;
+    if (handle->rx_pending_len > 0) {
+        got = handle->rx_pending_len < len ? handle->rx_pending_len : len;
+        memcpy(buf, handle->rx_pending, got);
+        handle->rx_pending_len -= got;
+        memmove(handle->rx_pending, &handle->rx_pending[got], handle->rx_pending_len);
+    }
+    if (got == len) return got;
+
+    int n = uart_read_bytes(handle->uart_port, buf + got, len - got, ticks_left(start, timeout));
+    if (n > 0) {
+        *from_uart = true;
+        got += (size_t)n;
+    }
+    return got;
+}
+
+/*
+ * Read one complete frame (header + len + data + tail) to the start of buf,
+ * bounded by the deadline start + timeout.
+ *
+ * Consumes exactly that frame: bytes preceding the header are dropped, bytes
+ * following the tail stay available for the next call. When a candidate frame
+ * turns out to be damaged (bad length or bad tail), only its first byte is
+ * dropped and the rest is scanned again, so a good frame that began inside the
+ * damaged one is still found. Frames longer than the buffer or than
+ * MAX_FRAME_SIZE are treated as damaged. On timeout the part of a frame that
+ * was already received is kept for the next call.
+ */
+static esp_err_t read_frame_until(ld2410c_handle_t *handle, const uint8_t *header, const uint8_t *tail, uint8_t *buf, size_t buf_size, size_t *frame_len,
+                                  TickType_t start, TickType_t timeout)
+{
+    size_t max_total = buf_size < MAX_FRAME_SIZE ? buf_size : MAX_FRAME_SIZE;
+    size_t have      = 0;
+    bool   got_any   = false;
 
     for (;;) {
         /* Sync on the header one byte at a time (header bytes are all distinct) */
         uint8_t b;
-        if (!read_exact(handle, &b, 1, start, timeout)) break;
-        got_any = true;
+        if (read_some(handle, &b, 1, start, timeout, &got_any) < 1) {
+            if (have > 0) rx_unread(handle, buf, have); /* a partial header */
+            break;
+        }
         if (b != header[have]) have = 0;
         if (b != header[have]) continue;
         buf[have++] = b;
         if (have < 4) continue;
         have = 0;
 
-        if (!read_exact(handle, &buf[4], 2, start, timeout)) break;
+        size_t got = read_some(handle, &buf[4], 2, start, timeout, &got_any);
+        if (got < 2) {
+            rx_unread(handle, buf, 4 + got);
+            break;
+        }
         size_t data_len = get_u16(buf, 4);
         size_t total    = FRAME_OVERHEAD + data_len;
-        if (total > buf_size) continue; /* corrupted length: resync */
+        if (total > max_total) {
+            rx_unread(handle, &buf[1], 5); /* corrupted length: resync after the first header byte */
+            continue;
+        }
 
-        if (!read_exact(handle, &buf[6], data_len + 4, start, timeout)) break;
-        if (memcmp(&buf[6 + data_len], tail, 4) != 0) continue;
+        got = read_some(handle, &buf[6], data_len + 4, start, timeout, &got_any);
+        if (got < data_len + 4) {
+            rx_unread(handle, buf, 6 + got);
+            break;
+        }
+        if (memcmp(&buf[6 + data_len], tail, 4) != 0) {
+            rx_unread(handle, &buf[1], total - 1); /* damaged tail: the next frame may start inside */
+            continue;
+        }
 
         *frame_len = total;
         return ESP_OK;
@@ -201,27 +271,47 @@ static esp_err_t read_frame(ld2410c_handle_t *handle, const uint8_t *header, con
     return got_any ? ESP_ERR_NOT_FOUND : ESP_ERR_TIMEOUT;
 }
 
+static esp_err_t read_frame(ld2410c_handle_t *handle, const uint8_t *header, const uint8_t *tail, uint8_t *buf, size_t buf_size, size_t *frame_len)
+{
+    return read_frame_until(handle, header, tail, buf, buf_size, frame_len, xTaskGetTickCount(), handle_timeout_ticks(handle));
+}
+
 static esp_err_t recv_ack(ld2410c_handle_t *handle, uint16_t expected_cmd, uint8_t *out_buf, size_t out_buf_size, size_t *out_len)
 {
-    uint8_t buf[MAX_FRAME_SIZE];
-    size_t  frame_len;
+    uint8_t    buf[MAX_FRAME_SIZE];
+    size_t     frame_len;
+    TickType_t start    = xTaskGetTickCount();
+    TickType_t timeout  = handle_timeout_ticks(handle);
+    esp_err_t  late_err = ESP_ERR_TIMEOUT; /* reported if the ACK we wait for never arrives */
 
-    if (read_frame(handle, cmd_header, cmd_tail, buf, sizeof(buf), &frame_len) != ESP_OK) {
-        ESP_LOGE(TAG, "Timeout waiting for ACK to cmd 0x%04X", expected_cmd);
-        return ESP_ERR_TIMEOUT;
+    for (;;) {
+        if (read_frame_until(handle, cmd_header, cmd_tail, buf, sizeof(buf), &frame_len, start, timeout) != ESP_OK) {
+            if (late_err == ESP_ERR_TIMEOUT) {
+                ESP_LOGE(TAG, "Timeout waiting for ACK to cmd 0x%04X", expected_cmd);
+            } else {
+                ESP_LOGE(TAG, "No ACK for cmd 0x%04X, got ACK for another command", expected_cmd);
+            }
+            return late_err;
+        }
+
+        /* A late ACK of an earlier, timed-out command may still be in front of ours: skip it */
+        uint16_t data_len = get_u16(buf, 4);
+        if (data_len >= 2) {
+            uint16_t ack_cmd = get_u16(buf, 6);
+            if (ack_cmd != (expected_cmd | ACK_BIT)) {
+                ESP_LOGW(TAG, "Skipping ACK 0x%04X while waiting for 0x%04X", ack_cmd, expected_cmd | ACK_BIT);
+                late_err = ESP_ERR_INVALID_RESPONSE;
+                if (ticks_left(start, timeout) == 0) return late_err;
+                continue;
+            }
+        }
+        break;
     }
 
     /* ACK data is at least cmd(2) + status(2) */
     uint16_t data_len = get_u16(buf, 4);
     if (data_len < 4) {
         ESP_LOGE(TAG, "ACK too short: %u", data_len);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    /* Verify ACK command word */
-    uint16_t ack_cmd = get_u16(buf, 6);
-    if (ack_cmd != (expected_cmd | ACK_BIT)) {
-        ESP_LOGE(TAG, "Unexpected ACK cmd: 0x%04X (expected 0x%04X)", ack_cmd, expected_cmd | ACK_BIT);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -254,7 +344,7 @@ static esp_err_t send_command(ld2410c_handle_t *handle, uint16_t cmd, const uint
     if (frame_len == 0) return ESP_ERR_INVALID_SIZE;
 
     /* Flush RX before sending */
-    uart_flush_input(handle->uart_port);
+    rx_flush(handle);
 
     esp_err_t err = send_frame(handle, frame, frame_len);
     if (err != ESP_OK) return err;
@@ -279,8 +369,9 @@ ld2410c_handle_t *ld2410c_init(uart_port_t port, int timeout_ms)
     if (!handle) {
         return NULL;
     }
-    handle->uart_port  = port;
-    handle->timeout_ms = timeout_ms;
+    handle->uart_port      = port;
+    handle->timeout_ms     = timeout_ms;
+    handle->rx_pending_len = 0;
     return handle;
 }
 
@@ -622,29 +713,36 @@ esp_err_t ld2410c_parse_engineering_data(const uint8_t *frame, size_t len, ld241
         return ESP_ERR_INVALID_ARG; /* not engineering mode data */
     }
 
-    /* Engineering extra data starts at d[11]; tail(1) + check(1) close the data */
-    size_t off = 11;
-    if (data_len < off + 2 + 2) return ESP_ERR_INVALID_SIZE;
+    /*
+     * Engineering extra data starts at d[11]: max moving gate, max stationary gate,
+     * moving energy per gate, stationary energy per gate, photosensitive, OUT,
+     * then tail(1) + check(1).
+     *
+     * The number of gates comes from the frame length, not from the max gate
+     * bytes: those report the configured range, while the module sends the
+     * energies of all gates (nine) even when fewer are configured.
+     */
+    if (data_len < ENG_DATA_OVERHEAD + 2 * MIN_ENG_GATES) return ESP_ERR_INVALID_SIZE;
+    size_t gate_bytes = data_len - ENG_DATA_OVERHEAD;
+    if (gate_bytes % 2 != 0 || gate_bytes / 2 > LD2410C_MAX_DISTANCE_GATES) return ESP_ERR_INVALID_SIZE;
+    size_t num_gates = gate_bytes / 2;
 
+    size_t off = 11;
     uint8_t max_moving_gate     = d[off++];
     uint8_t max_stationary_gate = d[off++];
     if (max_moving_gate > MAX_GATE || max_stationary_gate > MAX_GATE) {
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    /* moving[N+1] + stationary[N+1] + photosensitive(1) + out(1) + tail(1) + check(1) */
-    uint8_t num_gates = max_moving_gate + 1;
-    if (data_len < off + num_gates * 2 + 2 + 2) return ESP_ERR_INVALID_SIZE;
-
     memset(data, 0, sizeof(*data));
     parse_basic(d, &data->basic);
     data->max_moving_gate     = max_moving_gate;
     data->max_stationary_gate = max_stationary_gate;
 
-    for (int i = 0; i < num_gates; i++) {
+    for (size_t i = 0; i < num_gates; i++) {
         data->moving_gate_energy[i] = d[off++];
     }
-    for (int i = 0; i < num_gates; i++) {
+    for (size_t i = 0; i < num_gates; i++) {
         data->stationary_gate_energy[i] = d[off++];
     }
 
@@ -670,16 +768,39 @@ esp_err_t ld2410c_read_data_frame(ld2410c_handle_t *handle, uint8_t *buf, size_t
 
 /* ---------- high-level functions ---------- */
 
+/*
+ * Enter config mode. If the ACK timed out, the module may still have entered
+ * config mode, where it stops sending data frames, so leave it again (best effort).
+ */
+static esp_err_t config_begin(ld2410c_handle_t *handle)
+{
+    esp_err_t err = ld2410c_enable_config(handle);
+    if (err == ESP_ERR_TIMEOUT) {
+        ld2410c_end_config(handle);
+    }
+    return err;
+}
+
+/* Leave config mode, retrying once: a module stuck in config mode sends no data frames */
+static esp_err_t config_end(ld2410c_handle_t *handle)
+{
+    esp_err_t err = ld2410c_end_config(handle);
+    if (err != ESP_OK) {
+        err = ld2410c_end_config(handle);
+    }
+    return err;
+}
+
 /* Helper: run a block of commands inside enable_config / end_config */
 #define CONFIG_BEGIN(h)                                 \
     do {                                                \
-        esp_err_t _err = ld2410c_enable_config(h);      \
+        esp_err_t _err = config_begin(h);               \
         if (_err != ESP_OK) return _err;                \
     } while (0)
 
 #define CONFIG_END(h)                                   \
     do {                                                \
-        esp_err_t _err2 = ld2410c_end_config(h);        \
+        esp_err_t _err2 = config_end(h);                \
         if (_err2 != ESP_OK) return _err2;              \
     } while (0)
 
@@ -798,9 +919,11 @@ esp_err_t ld2410c_auto_calibrate(ld2410c_handle_t *handle, uint16_t duration_s, 
         CONFIG_BEGIN(handle);
         ld2410c_noise_status_t status;
         err = ld2410c_query_noise_detection_status(handle, &status);
-        CONFIG_END(handle);
+        esp_err_t end_err = config_end(handle);
 
+        /* Report the query's own error first, not the one from leaving config mode */
         if (err != ESP_OK) return err;
+        if (end_err != ESP_OK) return end_err;
 
         if (status == LD2410C_NOISE_COMPLETED) {
             ESP_LOGI(TAG, "Noise calibration completed");

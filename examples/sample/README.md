@@ -48,3 +48,11 @@ idf.py create-project-from-example "jef-sure/ld2410c:sample"
 4. Starts a FreeRTOS task that continuously reads data frames, parses target
    data, and logs state changes and distances.
 5. Monitors the OUT pin via GPIO interrupt for presence/no-presence edges.
+
+## Engineering Mode
+
+Set `EXAMPLE_ENGINEERING_MODE` to `1` in [main/main.c](main/main.c) to switch
+the module to engineering mode. The monitor task then also logs, for every
+report, the energy of each of the nine distance gates (moving and stationary),
+the light sensor value and the OUT pin level, which helps when tuning the gate
+sensitivities. The mode is lost on power cycle.

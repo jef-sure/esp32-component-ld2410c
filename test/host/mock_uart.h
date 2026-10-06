@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Clear RX data, queued responses, captured TX and the write limit. Time keeps running. */
+/* Clear RX data, queued responses, captured TX, the write limit and the tick length (back to 1 ms). Time keeps running. */
 void mock_reset(void);
 
 /* Make bytes available to uart_read_bytes() right away. */
@@ -24,3 +24,6 @@ const uint8_t *mock_tx(size_t *len);
 size_t         mock_write_count(void);
 
 uint32_t mock_now(void);
+
+/* Milliseconds per tick used by pdMS_TO_TICKS() (default 1), see FreeRTOS.h */
+extern uint32_t mock_ms_per_tick;

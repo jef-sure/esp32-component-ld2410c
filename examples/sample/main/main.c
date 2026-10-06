@@ -10,6 +10,11 @@
 
 static const char *TAG = "main";
 
+/* Set to 1 to switch the module to engineering mode and log the energy of every gate,
+   the light sensor and the OUT pin from each report (useful when tuning the gate
+   sensitivities). The mode is lost on power cycle. */
+#define EXAMPLE_ENGINEERING_MODE 0
+
 enum
 {
     UART_PORT_NUM  = UART_NUM_1,
@@ -74,6 +79,23 @@ static const char *target_state_str(ld2410c_target_state_t state)
     }
 }
 
+#if EXAMPLE_ENGINEERING_MODE
+static void log_engineering(const ld2410c_engineering_data_t *e)
+{
+    char   moving[4 * LD2410C_MAX_DISTANCE_GATES + 1]     = "";
+    char   stationary[4 * LD2410C_MAX_DISTANCE_GATES + 1] = "";
+    size_t mpos = 0, spos = 0;
+
+    for (int i = 0; i < LD2410C_MAX_DISTANCE_GATES; i++) {
+        mpos += snprintf(&moving[mpos], sizeof(moving) - mpos, "%3d ", e->moving_gate_energy[i]);
+        spos += snprintf(&stationary[spos], sizeof(stationary) - spos, "%3d ", e->stationary_gate_energy[i]);
+    }
+    ESP_LOGI(TAG, "ENG max gates %d/%d | moving: %s| stationary: %s| light=%d out=%d",
+             e->max_moving_gate, e->max_stationary_gate, moving, stationary,
+             e->photosensitive, e->out_pin_state);
+}
+#endif
+
 static void presence_monitor_task(void *arg)
 {
     uint8_t               buf[FRAME_BUF_SIZE];
@@ -95,6 +117,13 @@ static void presence_monitor_task(void *arg)
         if (ld2410c_read_data_frame(s_ld, buf, sizeof(buf), &len) != ESP_OK) continue;
 
         if (ld2410c_parse_target_data(buf, len, &target) != ESP_OK) continue;
+
+#if EXAMPLE_ENGINEERING_MODE
+        ld2410c_engineering_data_t eng;
+        if (ld2410c_parse_engineering_data(buf, len, &eng) == ESP_OK) {
+            log_engineering(&eng);
+        }
+#endif
 
         if (target.state != last_state) {
             ESP_LOGW(TAG, "State changed: %s -> %s",
@@ -162,6 +191,19 @@ void app_main(void)
     } else {
         ESP_LOGE(TAG, "Failed to configure detection: %s", esp_err_to_name(err));
     }
+
+#if EXAMPLE_ENGINEERING_MODE
+    err = ld2410c_enable_config(s_ld);
+    if (err == ESP_OK) {
+        err = ld2410c_enable_engineering_mode(s_ld);
+        ld2410c_end_config(s_ld);
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Engineering mode enabled");
+    } else {
+        ESP_LOGE(TAG, "Failed to enable engineering mode: %s", esp_err_to_name(err));
+    }
+#endif
 
     /* Start continuous presence monitoring. The driver is not thread-safe:
        from here on only the monitor task may use s_ld. */

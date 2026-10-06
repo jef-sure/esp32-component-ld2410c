@@ -103,12 +103,15 @@ typedef struct
  * @brief Extended target data reported in engineering mode.
  *
  * Includes per-gate energy values, photosensitive reading, and OUT pin state.
+ * The per-gate arrays hold gates 0 to 8, filled from as many gates as the
+ * frame carries (the module normally sends all nine, whatever maximum gate is
+ * configured); the remaining entries are 0.
  */
 typedef struct
 {
     ld2410c_target_data_t basic;                                       /**< Basic target info. */
-    uint8_t               max_moving_gate;                             /**< Max moving distance gate. */
-    uint8_t               max_stationary_gate;                         /**< Max stationary distance gate. */
+    uint8_t               max_moving_gate;                             /**< Max moving distance gate as reported in the frame. */
+    uint8_t               max_stationary_gate;                         /**< Max stationary distance gate as reported in the frame. */
     uint8_t               moving_gate_energy[LD2410C_MAX_DISTANCE_GATES];     /**< Per-gate moving energy. */
     uint8_t               stationary_gate_energy[LD2410C_MAX_DISTANCE_GATES]; /**< Per-gate stationary energy. */
     uint8_t               photosensitive;                              /**< Light sensor value (0-255). */
@@ -147,11 +150,24 @@ typedef struct
     ld2410c_out_level_t       out_default; /**< OUT pin default level. */
 } ld2410c_aux_ctrl_t;
 
-/** Driver handle. Stores UART port and command timeout. */
+/** Size of the internal buffer for bytes that were read from the UART but still belong to the stream. */
+#define LD2410C_RX_PENDING_SIZE 256
+
+/**
+ * Driver handle. Stores UART port and command timeout.
+ *
+ * Create it with ld2410c_init(); do not fill it in by hand. The rx_pending
+ * fields are private: they hold bytes that were read while looking for a
+ * frame and turned out not to belong to it (for example the start of the next
+ * frame after a frame with a damaged tail), so they are not lost.
+ */
 typedef struct
 {
     uart_port_t uart_port;  /**< UART port connected to the LD2410C. */
     int         timeout_ms; /**< ACK receive timeout in milliseconds. */
+
+    uint8_t rx_pending[LD2410C_RX_PENDING_SIZE]; /**< Private: bytes read ahead of the parser. */
+    size_t  rx_pending_len;                       /**< Private: number of valid bytes in rx_pending. */
 } ld2410c_handle_t;
 
 /* ========================================================================== */
@@ -317,10 +333,17 @@ esp_err_t ld2410c_parse_target_data(const uint8_t *frame, size_t len, ld2410c_ta
  * Extracts basic target data plus per-gate energy values,
  * photosensitive reading, and OUT pin state.
  *
+ * The number of gates in each array is taken from the length of the frame
+ * (17 + 2 * gates bytes of data), not from the configured maximum gates, so a
+ * module configured for fewer than 8 gates is parsed correctly. A frame with
+ * 1 to 9 gates is accepted.
+ *
  * @param frame Raw UART receive buffer.
  * @param len   Number of bytes in the buffer.
  * @param[out] data Parsed engineering data.
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG if frame is not engineering mode,
+ *         ESP_ERR_INVALID_SIZE if the data length does not fit 1 to 9 gates,
+ *         ESP_ERR_INVALID_RESPONSE if a reported max gate is above 8,
  *         otherwise the same errors as ld2410c_parse_target_data().
  */
 esp_err_t ld2410c_parse_engineering_data(const uint8_t *frame, size_t len, ld2410c_engineering_data_t *data);
@@ -333,14 +356,20 @@ esp_err_t ld2410c_parse_engineering_data(const uint8_t *frame, size_t len, ld241
  * call). On success buf holds exactly one frame, starting at buf[0], which can
  * be passed to ld2410c_parse_target_data() or ld2410c_parse_engineering_data().
  *
- * Only that frame is consumed from the UART: bytes after it stay in the UART
- * driver's RX buffer, so repeated calls return consecutive frames without
- * losing data to UART fragmentation.
+ * Only that frame is consumed from the stream: bytes after it stay available
+ * (in the UART driver's RX buffer or in the handle), so repeated calls return
+ * consecutive frames without losing data to UART fragmentation. A frame whose
+ * tail is damaged is skipped without swallowing the frames behind it.
+ *
+ * A timeout in the middle of a frame keeps the part that was received; the
+ * next call continues with it.
  *
  * @param handle   Driver handle.
  * @param buf      Buffer to receive the frame.
  * @param buf_size Size of the buffer: at least 23 for basic frames, 45 for
- *                 engineering frames (recommend >= 64). Larger frames are skipped.
+ *                 engineering frames (recommend >= 64). Larger frames are
+ *                 skipped, as are frames longer than 256 bytes (the module
+ *                 sends none).
  * @param[out] out_len Length of the frame in buf, 0 on failure. May be NULL.
  * @return ESP_OK if a complete data frame was read,
  *         ESP_ERR_NOT_FOUND if data was received but no valid frame,
@@ -401,6 +430,9 @@ esp_err_t ld2410c_factory_reset_and_restart(ld2410c_handle_t *handle);
  * @param duration_s       Detection duration in seconds.
  * @param poll_interval_ms Polling interval in milliseconds, must be > 0. Capped at
  *                         the overall timeout (duration_s + 15 s).
- * @return ESP_OK on success, ESP_ERR_TIMEOUT if calibration did not complete.
+ * @return ESP_OK on success,
+ *         ESP_ERR_TIMEOUT if calibration did not complete in time,
+ *         ESP_FAIL if the module reports that no detection is in progress,
+ *         otherwise the error of the failed command.
  */
 esp_err_t ld2410c_auto_calibrate(ld2410c_handle_t *handle, uint16_t duration_s, uint32_t poll_interval_ms);

@@ -23,6 +23,7 @@ static size_t     s_resp_count, s_resp_next;
 static bool       s_repeat_last;
 static int        s_write_limit = -1;
 static TickType_t s_now;
+uint32_t          mock_ms_per_tick = 1;
 
 void mock_reset(void)
 {
@@ -31,6 +32,7 @@ void mock_reset(void)
     s_resp_count = s_resp_next = 0;
     s_repeat_last = false;
     s_write_limit = -1;
+    mock_ms_per_tick = 1;
 }
 
 void mock_rx_feed(const uint8_t *data, size_t len)

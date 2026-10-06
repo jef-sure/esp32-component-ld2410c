@@ -94,6 +94,42 @@ static uint8_t *heap_copy(const uint8_t *src, size_t len)
     return p;
 }
 
+/*
+ * Engineering frame with gate_bytes bytes of per-gate energies (2 * gates for a
+ * well-formed frame): energy byte i is 0x10 + i, photosensitive 0x77, OUT 0x01.
+ * The basic part comes from the protocol example. Returns the frame length.
+ */
+static size_t make_eng_frame(uint8_t *f, size_t gate_bytes, uint8_t max_moving, uint8_t max_stationary)
+{
+    size_t data_len = 17 + gate_bytes;
+
+    memcpy(f, FRAME_ENG, 4);
+    f[4] = (uint8_t)data_len;
+    f[5] = 0x00;
+    memcpy(&f[6], &FRAME_ENG[6], 11); /* data type, head, basic target data */
+    f[17] = max_moving;
+    f[18] = max_stationary;
+    for (size_t i = 0; i < gate_bytes; i++) {
+        f[19 + i] = (uint8_t)(0x10 + i);
+    }
+    size_t pos = 19 + gate_bytes;
+    f[pos++]   = 0x77;
+    f[pos++]   = 0x01;
+    f[pos++]   = 0x55;
+    f[pos++]   = 0x00;
+    memcpy(&f[pos], &FRAME_ENG[sizeof(FRAME_ENG) - 4], 4);
+    return pos + 4;
+}
+
+/* Parse from an exact-size heap block so AddressSanitizer catches any overread */
+static esp_err_t parse_eng_exact(const uint8_t *f, size_t len, ld2410c_engineering_data_t *e)
+{
+    uint8_t  *p   = heap_copy(f, len);
+    esp_err_t err = ld2410c_parse_engineering_data(p, len, e);
+    free(p);
+    return err;
+}
+
 /* ---------- protocol examples ---------- */
 
 static void test_firmware_version(void)
@@ -211,6 +247,55 @@ static void test_parse_engineering(void)
     CHECK_EQ(t.state, LD2410C_TARGET_BOTH);
 }
 
+static void test_parse_engineering_gate_count(void)
+{
+    uint8_t                    f[64];
+    ld2410c_engineering_data_t e;
+    size_t                     len;
+
+    /* All nine gates while the module is configured for 6: the arrays must not be cut after gate 6 */
+    len = make_eng_frame(f, 18, 6, 6);
+    CHECK_EQ(len, 45);
+    CHECK_EQ(parse_eng_exact(f, len, &e), ESP_OK);
+    CHECK_EQ(e.max_moving_gate, 6);
+    CHECK_EQ(e.max_stationary_gate, 6);
+    for (int i = 0; i < LD2410C_MAX_DISTANCE_GATES; i++) {
+        CHECK_EQ(e.moving_gate_energy[i], 0x10 + i);
+        CHECK_EQ(e.stationary_gate_energy[i], 0x19 + i);
+    }
+    CHECK_EQ(e.photosensitive, 0x77);
+    CHECK_EQ(e.out_pin_state, 0x01);
+
+    /* A frame carrying 7 gates (max gate + 1): parsed as far as it goes, the rest is 0 */
+    len = make_eng_frame(f, 14, 6, 6);
+    CHECK_EQ(parse_eng_exact(f, len, &e), ESP_OK);
+    for (int i = 0; i < 7; i++) {
+        CHECK_EQ(e.moving_gate_energy[i], 0x10 + i);
+        CHECK_EQ(e.stationary_gate_energy[i], 0x17 + i);
+    }
+    for (int i = 7; i < LD2410C_MAX_DISTANCE_GATES; i++) {
+        CHECK_EQ(e.moving_gate_energy[i], 0);
+        CHECK_EQ(e.stationary_gate_energy[i], 0);
+    }
+    CHECK_EQ(e.photosensitive, 0x77);
+    CHECK_EQ(e.out_pin_state, 0x01);
+
+    /* A single gate is the smallest valid frame */
+    len = make_eng_frame(f, 2, 2, 2);
+    CHECK_EQ(parse_eng_exact(f, len, &e), ESP_OK);
+    CHECK_EQ(e.moving_gate_energy[0], 0x10);
+    CHECK_EQ(e.stationary_gate_energy[0], 0x11);
+    CHECK_EQ(e.moving_gate_energy[1], 0);
+    CHECK_EQ(e.photosensitive, 0x77);
+
+    /* Lengths that do not fit 1 to 9 gates: none, half a gate, an odd byte count, ten gates */
+    static const size_t bad_gate_bytes[] = {0, 1, 19, 20};
+    for (size_t i = 0; i < sizeof(bad_gate_bytes) / sizeof(bad_gate_bytes[0]); i++) {
+        len = make_eng_frame(f, bad_gate_bytes[i], 8, 8);
+        CHECK_EQ(parse_eng_exact(f, len, &e), ESP_ERR_INVALID_SIZE);
+    }
+}
+
 /* ---------- malformed frames ---------- */
 
 static void test_parse_short_frames(void)
@@ -238,7 +323,7 @@ static void test_parse_short_frames(void)
     CHECK_EQ(ld2410c_parse_engineering_data(f, sizeof(FRAME_BASIC), &e), ESP_ERR_INVALID_SIZE);
     free(f);
 
-    /* Engineering frame claiming more gates than it carries */
+    /* Engineering frame whose max moving gate byte is out of range */
     f     = heap_copy(FRAME_ENG, sizeof(FRAME_ENG));
     f[17] = 0x09;
     CHECK_EQ(ld2410c_parse_engineering_data(f, sizeof(FRAME_ENG), &e), ESP_ERR_INVALID_RESPONSE);
@@ -420,11 +505,13 @@ static void test_read_data_frame_timeout(void)
     CHECK_EQ(len, 0);
     CHECK_EQ(mock_now() - start, TIMEOUT_MS);
 
-    /* A frame with a corrupted tail is skipped, the next one is returned */
+    /* A frame with a corrupted tail is skipped, the next one is returned.
+       The read above ended in the middle of a frame, which the handle keeps: start the stream afresh. */
     uint8_t bad[sizeof(FRAME_BASIC)];
     memcpy(bad, FRAME_BASIC, sizeof(bad));
     bad[sizeof(bad) - 2] = 0x00;
     mock_reset();
+    ld->rx_pending_len = 0;
     mock_rx_feed(bad, sizeof(bad));
     mock_rx_feed(FRAME_ENG, sizeof(FRAME_ENG));
     CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_OK);
@@ -441,6 +528,170 @@ static void test_read_data_frame_timeout(void)
     free(small);
 
     CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(FRAME_BASIC) - 1, &len), ESP_ERR_INVALID_SIZE);
+
+    ld2410c_deinit(&ld);
+}
+
+static void test_read_data_frame_resync_after_damaged_frame(void)
+{
+    ld2410c_handle_t *ld = new_handle();
+    uint8_t           buf[64];
+    size_t            len;
+
+    /* A frame that lost a byte on the wire: reading its declared length swallows the first byte of the next frame */
+    uint8_t lost[sizeof(FRAME_BASIC) - 1];
+    memcpy(lost, FRAME_BASIC, 10);
+    memcpy(&lost[10], &FRAME_BASIC[11], sizeof(FRAME_BASIC) - 11);
+    mock_rx_feed(lost, sizeof(lost));
+    mock_rx_feed(FRAME_BASIC, sizeof(FRAME_BASIC));
+    mock_rx_feed(FRAME_ENG, sizeof(FRAME_ENG));
+
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_OK);
+    CHECK_EQ(len, sizeof(FRAME_BASIC));
+    CHECK(memcmp(buf, FRAME_BASIC, sizeof(FRAME_BASIC)) == 0);
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_OK);
+    CHECK_EQ(len, sizeof(FRAME_ENG));
+    CHECK(memcmp(buf, FRAME_ENG, sizeof(FRAME_ENG)) == 0);
+    CHECK_EQ(ld->rx_pending_len, 0);
+
+    /* A length field that is too large (but still fits the buffer): the frames behind it are found too,
+       even those that were already read past the end of the first one */
+    mock_reset();
+    uint8_t bad_len[sizeof(FRAME_BASIC)];
+    memcpy(bad_len, FRAME_BASIC, sizeof(bad_len));
+    bad_len[4] = 0x30;
+    mock_rx_feed(bad_len, sizeof(bad_len));
+    mock_rx_feed(FRAME_BASIC, sizeof(FRAME_BASIC));
+    mock_rx_feed(FRAME_ENG, sizeof(FRAME_ENG));
+
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_OK);
+    CHECK_EQ(len, sizeof(FRAME_BASIC));
+    CHECK(memcmp(buf, FRAME_BASIC, sizeof(FRAME_BASIC)) == 0);
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_OK);
+    CHECK_EQ(len, sizeof(FRAME_ENG));
+    CHECK(memcmp(buf, FRAME_ENG, sizeof(FRAME_ENG)) == 0);
+    CHECK_EQ(ld->rx_pending_len, 0);
+
+    /* The data ends in the middle of the damaged frame: nothing is lost, the frames behind it
+       are returned once the rest arrives */
+    mock_reset();
+    mock_rx_feed(bad_len, sizeof(bad_len));
+    mock_rx_feed(FRAME_BASIC, sizeof(FRAME_BASIC));
+    uint32_t start = mock_now();
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_ERR_NOT_FOUND);
+    CHECK_EQ(len, 0);
+    CHECK_EQ(mock_now() - start, TIMEOUT_MS);
+    CHECK(ld->rx_pending_len > 0);
+
+    mock_rx_feed(FRAME_ENG, sizeof(FRAME_ENG));
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_OK);
+    CHECK_EQ(len, sizeof(FRAME_BASIC));
+    CHECK(memcmp(buf, FRAME_BASIC, sizeof(FRAME_BASIC)) == 0);
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_OK);
+    CHECK_EQ(len, sizeof(FRAME_ENG));
+    CHECK_EQ(ld->rx_pending_len, 0);
+
+    /* A partial header at the end of the data is kept as well, and completed later */
+    mock_rx_feed(FRAME_BASIC, 2);
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_ERR_NOT_FOUND);
+    mock_rx_feed(&FRAME_BASIC[2], sizeof(FRAME_BASIC) - 2);
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_OK);
+    CHECK(memcmp(buf, FRAME_BASIC, sizeof(FRAME_BASIC)) == 0);
+
+    /* Silence after that is a plain timeout again, not "data without a frame" */
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_ERR_TIMEOUT);
+
+    /* A command starts from a clean slate: bytes held back from earlier frames are dropped with the UART input */
+    mock_reset();
+    mock_rx_feed(bad_len, sizeof(bad_len));
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_ERR_NOT_FOUND);
+    CHECK(ld->rx_pending_len > 0);
+    mock_reset();
+    QUEUE(ACK_END);
+    CHECK_EQ(ld2410c_end_config(ld), ESP_OK);
+    CHECK_EQ(ld->rx_pending_len, 0);
+
+    ld2410c_deinit(&ld);
+}
+
+static void test_stale_ack_is_skipped(void)
+{
+    ld2410c_handle_t      *ld = new_handle();
+    ld2410c_firmware_ver_t ver;
+
+    /* The late ACK of an earlier command precedes the one we wait for */
+    uint8_t resp[sizeof(ACK_END) + sizeof(ACK_FIRMWARE)];
+    memcpy(resp, ACK_END, sizeof(ACK_END));
+    memcpy(&resp[sizeof(ACK_END)], ACK_FIRMWARE, sizeof(ACK_FIRMWARE));
+    mock_queue_response(resp, sizeof(resp));
+
+    uint32_t start = mock_now();
+    CHECK_EQ(ld2410c_read_firmware_version(ld, &ver), ESP_OK);
+    CHECK_EQ(ver.patch, 0x22091516);
+    CHECK_EQ(mock_now() - start, 0);
+
+    /* Only the wrong ACK ever arrives: the call waits for the right one, then reports it */
+    mock_reset();
+    QUEUE(ACK_END);
+    start = mock_now();
+    CHECK_EQ(ld2410c_read_firmware_version(ld, &ver), ESP_ERR_INVALID_RESPONSE);
+    CHECK_EQ(mock_now() - start, TIMEOUT_MS);
+
+    ld2410c_deinit(&ld);
+}
+
+static void test_timeout_shorter_than_one_tick(void)
+{
+    ld2410c_handle_t      *ld = ld2410c_init(UART_NUM_1, 5);
+    ld2410c_firmware_ver_t ver;
+    uint8_t                buf[64];
+    size_t                 len;
+
+    CHECK(ld != NULL);
+
+    /* A tick is 10 ms (100 Hz): 5 ms rounds down to 0 ticks, but the wait must still last one tick */
+    mock_ms_per_tick = 10;
+    uint32_t start   = mock_now();
+    CHECK_EQ(ld2410c_read_firmware_version(ld, &ver), ESP_ERR_TIMEOUT);
+    CHECK_EQ(mock_now() - start, 1);
+
+    start = mock_now();
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_ERR_TIMEOUT);
+    CHECK_EQ(mock_now() - start, 1);
+
+    mock_ms_per_tick = 1;
+    ld2410c_deinit(&ld);
+}
+
+static void test_config_mode_is_left_again(void)
+{
+    ld2410c_handle_t *ld = new_handle();
+    char              str[32];
+
+    /* The ACK of enable_config is lost: the module may be in config mode, so end_config is sent anyway */
+    CHECK_EQ(ld2410c_get_firmware_string(ld, str, sizeof(str)), ESP_ERR_TIMEOUT);
+    CHECK_EQ(mock_write_count(), 2);
+    size_t         tx_len;
+    const uint8_t *tx = mock_tx(&tx_len);
+    CHECK_EQ(tx_len, 14 + 12);
+    CHECK(tx_len == 26 && tx[6] == 0xFF && tx[20] == 0xFE);
+
+    /* The ACK of the final end_config is lost: it is sent once more */
+    static const uint8_t junk[] = {0x00};
+    mock_reset();
+    QUEUE(ACK_ENABLE);
+    QUEUE(ACK_FIRMWARE);
+    QUEUE(junk);
+    QUEUE(ACK_END);
+    CHECK_EQ(ld2410c_get_firmware_string(ld, str, sizeof(str)), ESP_OK);
+    CHECK_EQ(mock_write_count(), 4);
+
+    /* If the second end_config fails as well, the error is returned */
+    mock_reset();
+    QUEUE(ACK_ENABLE);
+    QUEUE(ACK_FIRMWARE);
+    CHECK_EQ(ld2410c_get_firmware_string(ld, str, sizeof(str)), ESP_ERR_TIMEOUT);
+    CHECK_EQ(mock_write_count(), 4);
 
     ld2410c_deinit(&ld);
 }
@@ -596,6 +847,29 @@ static void test_auto_calibrate(void)
     ld2410c_deinit(&ld);
 }
 
+static void test_auto_calibrate_errors(void)
+{
+    static const uint8_t ack_noise_failed[] = {0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0x1B, 0x01, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01};
+    static const uint8_t ack_noise_idle[]   = {0xFD, 0xFC, 0xFB, 0xFA, 0x06, 0x00, 0x1B, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01};
+    ld2410c_handle_t    *ld                 = new_handle();
+
+    /* The query fails and so does leaving config mode: the error of the query is reported */
+    queue_calibration_start();
+    QUEUE(ACK_ENABLE);
+    QUEUE(ack_noise_failed);
+    CHECK_EQ(ld2410c_auto_calibrate(ld, 10, 1000), ESP_FAIL);
+
+    /* The module says no detection is running */
+    mock_reset();
+    queue_calibration_start();
+    QUEUE(ACK_ENABLE);
+    QUEUE(ack_noise_idle);
+    QUEUE(ACK_END);
+    CHECK_EQ(ld2410c_auto_calibrate(ld, 10, 1000), ESP_FAIL);
+
+    ld2410c_deinit(&ld);
+}
+
 int main(void)
 {
     RUN(test_firmware_version);
@@ -604,6 +878,7 @@ int main(void)
     RUN(test_command_encoding);
     RUN(test_parse_basic);
     RUN(test_parse_engineering);
+    RUN(test_parse_engineering_gate_count);
     RUN(test_parse_short_frames);
     RUN(test_parse_corrupted_envelope);
     RUN(test_malformed_ack);
@@ -611,9 +886,14 @@ int main(void)
     RUN(test_partial_write);
     RUN(test_read_data_frame_fragmented);
     RUN(test_read_data_frame_timeout);
+    RUN(test_read_data_frame_resync_after_damaged_frame);
+    RUN(test_stale_ack_is_skipped);
+    RUN(test_timeout_shorter_than_one_tick);
+    RUN(test_config_mode_is_left_again);
     RUN(test_invalid_arguments);
     RUN(test_boundary_values_accepted);
     RUN(test_auto_calibrate);
+    RUN(test_auto_calibrate_errors);
 
     printf("\n%d checks, %d failures\n", s_checks, s_failures);
     return s_failures ? 1 : 0;
