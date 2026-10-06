@@ -4,7 +4,7 @@ ESP-IDF driver component for the HLK-LD2410C human presence sensing radar module
 
 ## Features
 
-- Full implementation of LD2410C serial communication protocol V1.07
+- Full implementation of LD2410C serial communication protocol V1.09
 - Low-level command functions with manual configuration mode control
 - High-level convenience wrappers for common operations
 - Data frame reader and parsers for target detection and engineering data
@@ -141,8 +141,8 @@ Require manual `ld2410c_enable_config()` / `ld2410c_end_config()` wrapping:
 - `ld2410c_enable_engineering_mode()` / `ld2410c_disable_engineering_mode()`
 - `ld2410c_read_firmware_version()` - Read firmware version
 - `ld2410c_set_baud_rate()` - Change UART baud rate
-- `ld2410c_factory_reset()` / `ld2410c_restart()`
-- `ld2410c_set_bluetooth()` / `ld2410c_get_mac_address()` / `ld2410c_set_bluetooth_password()`
+- `ld2410c_factory_reset()` / `ld2410c_restart()` - wait `LD2410C_RESTART_DELAY_MS` (1 s) after a restart before the next command
+- `ld2410c_set_bluetooth()` / `ld2410c_get_bluetooth()` / `ld2410c_get_mac_address()` / `ld2410c_set_bluetooth_password()`
 - `ld2410c_set_distance_resolution()` / `ld2410c_get_distance_resolution()`
 - `ld2410c_set_aux_control()` / `ld2410c_get_aux_control()`
 - `ld2410c_start_noise_detection()` / `ld2410c_query_noise_detection_status()`
@@ -157,8 +157,10 @@ Automatically handle configuration mode:
 
 ### Data Frame Reader & Parsers
 - `ld2410c_read_data_frame()` - Read exactly one raw data frame from UART
+- `ld2410c_flush_input()` - Discard received bytes that were not read yet (UART buffer and handle)
 - `ld2410c_parse_target_data()` - Parse basic target detection data
 - `ld2410c_parse_engineering_data()` - Parse detailed engineering mode data
+- `ld2410c_target_is_present()` / `ld2410c_target_is_moving()` / `ld2410c_target_is_stationary()` - Test a target state
 
 ## Testing
 
@@ -190,4 +192,5 @@ Anton Petrusevich <anton.petrusevich.mobile@gmail.com>
 ## References
 
 - [HLK-LD2410C Product Page](http://www.hlktech.net/index.php?id=988)
-- Protocol Version: V1.07
+- [Serial protocol reference](docs/protocol.md) - translated and condensed from the vendor protocol document V1.09
+- [Module reference](docs/module.md) - pins, electrical data, mounting and Bluetooth, translated from the vendor manual V1.09

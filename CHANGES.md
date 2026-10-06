@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.1.2 — 2026-10-06
+
+### Fixed
+
+- The high-level wrappers retried `end_config` only on the success path. When a
+  command inside a wrapper failed, `end_config` was sent once, so a lost ACK
+  could still leave the module in config mode. It is now retried there too.
+  `ld2410c_factory_reset_and_restart()` still sends it once after the restart
+  command, because the module is restarting.
+- `ld2410c_auto_calibrate()` gave up on the first status poll whose ACK was lost
+  or garbled, although the calibration was still running. Such a poll is now
+  repeated at the next interval; the call returns the error after three of them
+  in a row. An error status from the module still ends the call at once.
+
+### Added
+
+- `ld2410c_flush_input()` discards the UART input together with the bytes the
+  handle keeps from an earlier read. Use it instead of `uart_flush_input()`,
+  which leaves the part of a frame kept in the handle.
+- `ld2410c_get_bluetooth()` tells whether Bluetooth is on. The protocol has no
+  query for it; with Bluetooth off the module answers the MAC address query with
+  the placeholder 08:05:04:03:02:01, which is how the ESPHome `ld2410` component
+  detects it too.
+- `ld2410c_target_is_present()`, `ld2410c_target_is_moving()` and
+  `ld2410c_target_is_stationary()` test a target state. The noise detection
+  states are not targets.
+- `LD2410C_RESTART_DELAY_MS` (1000): the time to wait after a restart before the
+  next command, now documented for `ld2410c_restart()` and
+  `ld2410c_factory_reset_and_restart()`.
+- Host tests for the above.
+- `docs/protocol.md` and `docs/module.md`: the vendor's serial protocol V1.09
+  and user manual V1.09, translated from Chinese and condensed.
+
+### Changed
+
+- The driver was checked against the protocol document V1.09 (2025-06-09). It
+  adds no commands over V1.07; the documentation now says that the Bluetooth
+  password takes effect after a restart and that `out_pin_state` is 0 (no one)
+  or 1 (someone).
+
 ## 0.1.1 — 2026-10-06
 
 ### Fixed

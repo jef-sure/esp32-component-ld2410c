@@ -2,7 +2,7 @@
  * @file ld2410c.h
  * @brief ESP-IDF driver for the HLK-LD2410C human presence sensing radar module.
  *
- * Implements the LD2410C serial communication protocol V1.07.
+ * Implements the LD2410C serial communication protocol V1.09.
  * Provides low-level command functions (require manual enable_config/end_config),
  * high-level convenience wrappers, and data frame parsers.
  *
@@ -40,6 +40,31 @@ typedef enum
     LD2410C_TARGET_NOISE_OK   = 0x05, /**< Noise detection completed successfully. */
     LD2410C_TARGET_NOISE_FAIL = 0x06, /**< Noise detection failed. */
 } ld2410c_target_state_t;
+
+/** @brief True if the state reports a moving target (alone or together with a stationary one). */
+static inline bool ld2410c_target_is_moving(ld2410c_target_state_t state)
+{
+    return state == LD2410C_TARGET_MOVING || state == LD2410C_TARGET_BOTH;
+}
+
+/** @brief True if the state reports a stationary target (alone or together with a moving one). */
+static inline bool ld2410c_target_is_stationary(ld2410c_target_state_t state)
+{
+    return state == LD2410C_TARGET_STATIONARY || state == LD2410C_TARGET_BOTH;
+}
+
+/** @brief True if the state reports any target. The noise detection states (0x04 to 0x06) are not targets. */
+static inline bool ld2410c_target_is_present(ld2410c_target_state_t state)
+{
+    return ld2410c_target_is_moving(state) || ld2410c_target_is_stationary(state);
+}
+
+/**
+ * Time to wait after ld2410c_restart() or ld2410c_factory_reset_and_restart()
+ * before sending the next command, in milliseconds. The vendor documents give
+ * no figure; this is the delay the ESPHome ld2410 component uses.
+ */
+#define LD2410C_RESTART_DELAY_MS 1000
 
 /** Serial port baud rate selection indices. Factory default: LD2410C_BAUD_256000. */
 typedef enum
@@ -115,7 +140,7 @@ typedef struct
     uint8_t               moving_gate_energy[LD2410C_MAX_DISTANCE_GATES];     /**< Per-gate moving energy. */
     uint8_t               stationary_gate_energy[LD2410C_MAX_DISTANCE_GATES]; /**< Per-gate stationary energy. */
     uint8_t               photosensitive;                              /**< Light sensor value (0-255). */
-    uint8_t               out_pin_state;                               /**< Current OUT pin level. */
+    uint8_t               out_pin_state;                               /**< OUT pin state: 0 no one, 1 someone. */
 } ld2410c_engineering_data_t;
 
 /** Radar configuration parameters as read from the module. */
@@ -252,7 +277,12 @@ esp_err_t ld2410c_set_baud_rate(ld2410c_handle_t *handle, ld2410c_baud_t baud);
 /** @brief Restore factory default settings (cmd 0x00A2). Takes effect after restart. */
 esp_err_t ld2410c_factory_reset(ld2410c_handle_t *handle);
 
-/** @brief Restart the module (cmd 0x00A3). */
+/**
+ * @brief Restart the module (cmd 0x00A3).
+ *
+ * The module restarts after it has sent the ACK and does not answer while it
+ * starts up: wait LD2410C_RESTART_DELAY_MS before the next command.
+ */
 esp_err_t ld2410c_restart(ld2410c_handle_t *handle);
 
 /**
@@ -263,12 +293,28 @@ esp_err_t ld2410c_set_bluetooth(ld2410c_handle_t *handle, bool enable);
 
 /**
  * @brief Query the module's MAC address (cmd 0x00A5).
+ *
+ * With Bluetooth switched off the module answers with the placeholder
+ * 08:05:04:03:02:01 instead of its address; see ld2410c_get_bluetooth().
+ *
  * @param[out] mac 6-byte MAC address in big-endian order.
  */
 esp_err_t ld2410c_get_mac_address(ld2410c_handle_t *handle, uint8_t mac[6]);
 
 /**
- * @brief Set the Bluetooth password (cmd 0x00A9).
+ * @brief Find out whether Bluetooth is switched on.
+ *
+ * The protocol has no query for it. This reads the MAC address (cmd 0x00A5)
+ * and reports Bluetooth as off when the module answers with the placeholder
+ * address 08:05:04:03:02:01. The vendor documents do not describe the
+ * placeholder; the ESPHome ld2410 component detects Bluetooth the same way.
+ *
+ * @param[out] enabled true if Bluetooth is on.
+ */
+esp_err_t ld2410c_get_bluetooth(ld2410c_handle_t *handle, bool *enabled);
+
+/**
+ * @brief Set the Bluetooth password (cmd 0x00A9). Takes effect after restart.
  * @param password 6-character password. Default: "HiLink".
  */
 esp_err_t ld2410c_set_bluetooth_password(ld2410c_handle_t *handle, const char password[6]);
@@ -378,6 +424,20 @@ esp_err_t ld2410c_parse_engineering_data(const uint8_t *frame, size_t len, ld241
  */
 esp_err_t ld2410c_read_data_frame(ld2410c_handle_t *handle, uint8_t *buf, size_t buf_size, size_t *out_len);
 
+/**
+ * @brief Discard all received bytes that were not read yet.
+ *
+ * Clears the UART driver's RX buffer and the bytes the handle keeps from an
+ * earlier read (see ld2410c_read_data_frame()). Use it instead of
+ * uart_flush_input() to drop stale reports, for example after a long pause
+ * between reads: uart_flush_input() alone leaves the part of a frame that is
+ * kept in the handle. Command functions do this themselves.
+ *
+ * @param handle Driver handle.
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if handle is NULL.
+ */
+esp_err_t ld2410c_flush_input(ld2410c_handle_t *handle);
+
 /* ========================================================================== */
 /*  High-level convenience functions (auto-wrap enable_config/end_config)     */
 /* ========================================================================== */
@@ -418,7 +478,11 @@ esp_err_t ld2410c_get_firmware_string(ld2410c_handle_t *handle, char *buf, size_
  */
 esp_err_t ld2410c_get_full_config(ld2410c_handle_t *handle, ld2410c_params_t *params, ld2410c_resolution_t *resolution);
 
-/** @brief Factory reset and restart the module in one call. */
+/**
+ * @brief Factory reset and restart the module in one call.
+ *
+ * Wait LD2410C_RESTART_DELAY_MS before the next command, see ld2410c_restart().
+ */
 esp_err_t ld2410c_factory_reset_and_restart(ld2410c_handle_t *handle);
 
 /**
@@ -430,6 +494,9 @@ esp_err_t ld2410c_factory_reset_and_restart(ld2410c_handle_t *handle);
  * @param duration_s       Detection duration in seconds.
  * @param poll_interval_ms Polling interval in milliseconds, must be > 0. Capped at
  *                         the overall timeout (duration_s + 15 s).
+ * A status poll whose ACK is lost or garbled is repeated at the next interval;
+ * the call gives up after three such polls in a row.
+ *
  * @return ESP_OK on success,
  *         ESP_ERR_TIMEOUT if calibration did not complete in time,
  *         ESP_FAIL if the module reports that no detection is in progress,

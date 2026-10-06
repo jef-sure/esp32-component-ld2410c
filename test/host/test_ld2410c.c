@@ -165,7 +165,37 @@ static void test_mac_address(void)
     CHECK_EQ(ld2410c_get_mac_address(ld, mac), ESP_OK);
     CHECK(memcmp(mac, expected, sizeof(mac)) == 0);
 
+    /* A real address means Bluetooth is on, the placeholder address means it is off */
+    static const uint8_t ack_no_mac[] = {0xFD, 0xFC, 0xFB, 0xFA, 0x0A, 0x00, 0xA5, 0x01, 0x00, 0x00,
+                                         0x08, 0x05, 0x04, 0x03, 0x02, 0x01, 0x04, 0x03, 0x02, 0x01};
+    bool                 enabled      = false;
+    mock_reset();
+    QUEUE(ACK_MAC);
+    CHECK_EQ(ld2410c_get_bluetooth(ld, &enabled), ESP_OK);
+    CHECK(enabled);
+    mock_reset();
+    QUEUE(ack_no_mac);
+    CHECK_EQ(ld2410c_get_bluetooth(ld, &enabled), ESP_OK);
+    CHECK(!enabled);
+    mock_reset();
+    CHECK_EQ(ld2410c_get_bluetooth(ld, &enabled), ESP_ERR_TIMEOUT);
+    CHECK_EQ(ld2410c_get_bluetooth(ld, NULL), ESP_ERR_INVALID_ARG);
+
     ld2410c_deinit(&ld);
+}
+
+static void test_target_state_helpers(void)
+{
+    CHECK(!ld2410c_target_is_present(LD2410C_TARGET_NONE));
+    CHECK(ld2410c_target_is_moving(LD2410C_TARGET_MOVING) && !ld2410c_target_is_stationary(LD2410C_TARGET_MOVING));
+    CHECK(!ld2410c_target_is_moving(LD2410C_TARGET_STATIONARY) && ld2410c_target_is_stationary(LD2410C_TARGET_STATIONARY));
+    CHECK(ld2410c_target_is_moving(LD2410C_TARGET_BOTH) && ld2410c_target_is_stationary(LD2410C_TARGET_BOTH));
+    CHECK(ld2410c_target_is_present(LD2410C_TARGET_MOVING) && ld2410c_target_is_present(LD2410C_TARGET_BOTH));
+
+    /* The noise detection states share bits with the target states but are not targets */
+    CHECK(!ld2410c_target_is_present(LD2410C_TARGET_NOISE_DET));
+    CHECK(!ld2410c_target_is_present(LD2410C_TARGET_NOISE_OK));
+    CHECK(!ld2410c_target_is_present(LD2410C_TARGET_NOISE_FAIL));
 }
 
 static void test_read_params(void)
@@ -693,6 +723,44 @@ static void test_config_mode_is_left_again(void)
     CHECK_EQ(ld2410c_get_firmware_string(ld, str, sizeof(str)), ESP_ERR_TIMEOUT);
     CHECK_EQ(mock_write_count(), 4);
 
+    /* A command in the middle fails and the ACK of end_config is lost: end_config is sent once more,
+       the error of the command is returned */
+    mock_reset();
+    QUEUE(ACK_ENABLE);
+    QUEUE(junk);
+    QUEUE(junk);
+    QUEUE(ACK_END);
+    CHECK_EQ(ld2410c_get_firmware_string(ld, str, sizeof(str)), ESP_ERR_TIMEOUT);
+    CHECK_EQ(mock_write_count(), 4);
+    tx = mock_tx(&tx_len);
+    CHECK_EQ(tx_len, 14 + 12 + 12 + 12);
+    CHECK(tx_len == 50 && tx[32] == 0xFE && tx[44] == 0xFE);
+
+    ld2410c_deinit(&ld);
+}
+
+static void test_flush_input(void)
+{
+    ld2410c_handle_t *ld = new_handle();
+    uint8_t           buf[64];
+    size_t            len;
+
+    /* A read that ends in the middle of a frame keeps that part in the handle */
+    mock_rx_feed(FRAME_ENG, 20);
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_ERR_NOT_FOUND);
+    CHECK_EQ(ld->rx_pending_len, 20);
+
+    /* The flush drops it together with the bytes still in the UART driver */
+    mock_rx_feed(FRAME_ENG, 10);
+    CHECK_EQ(ld2410c_flush_input(ld), ESP_OK);
+    CHECK_EQ(ld->rx_pending_len, 0);
+    mock_rx_feed(FRAME_BASIC, sizeof(FRAME_BASIC));
+    CHECK_EQ(ld2410c_read_data_frame(ld, buf, sizeof(buf), &len), ESP_OK);
+    CHECK_EQ(len, sizeof(FRAME_BASIC));
+    CHECK(memcmp(buf, FRAME_BASIC, sizeof(FRAME_BASIC)) == 0);
+
+    CHECK_EQ(ld2410c_flush_input(NULL), ESP_ERR_INVALID_ARG);
+
     ld2410c_deinit(&ld);
 }
 
@@ -867,6 +935,27 @@ static void test_auto_calibrate_errors(void)
     QUEUE(ACK_END);
     CHECK_EQ(ld2410c_auto_calibrate(ld, 10, 1000), ESP_FAIL);
 
+    /* The ACK of one poll is lost: the status is asked again at the next poll */
+    static const uint8_t junk[] = {0x00};
+    mock_reset();
+    queue_calibration_start();
+    QUEUE(junk); /* enable_config: no ACK */
+    QUEUE(ACK_END);
+    QUEUE(ACK_ENABLE);
+    QUEUE(junk); /* status query: no ACK */
+    QUEUE(ACK_END);
+    QUEUE(ACK_ENABLE);
+    QUEUE(ACK_NOISE_DONE);
+    QUEUE(ACK_END);
+    CHECK_EQ(ld2410c_auto_calibrate(ld, 10, 1000), ESP_OK);
+    CHECK_EQ(mock_write_count(), 3 + 2 + 3 + 3);
+
+    /* The module stops answering: give up after three polls in a row */
+    mock_reset();
+    queue_calibration_start();
+    CHECK_EQ(ld2410c_auto_calibrate(ld, 10, 1000), ESP_ERR_TIMEOUT);
+    CHECK_EQ(mock_write_count(), 3 + 3 * 2);
+
     ld2410c_deinit(&ld);
 }
 
@@ -874,6 +963,7 @@ int main(void)
 {
     RUN(test_firmware_version);
     RUN(test_mac_address);
+    RUN(test_target_state_helpers);
     RUN(test_read_params);
     RUN(test_command_encoding);
     RUN(test_parse_basic);
@@ -890,6 +980,7 @@ int main(void)
     RUN(test_stale_ack_is_skipped);
     RUN(test_timeout_shorter_than_one_tick);
     RUN(test_config_mode_is_left_again);
+    RUN(test_flush_input);
     RUN(test_invalid_arguments);
     RUN(test_boundary_values_accepted);
     RUN(test_auto_calibrate);

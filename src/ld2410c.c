@@ -58,6 +58,7 @@ enum
        + photosensitive(1) + out(1) + tail(1) + check(1). Each gate adds moving(1) + stationary(1). */
     ENG_DATA_OVERHEAD = 17,
     MIN_ENG_GATES     = 1,
+    MAX_FAILED_POLLS    = 3, /* auto calibration gives up after this many unanswered status polls in a row */
     REPORT_HEAD         = 0xAA,
     REPORT_TAIL         = 0x55,
     REPORT_CHECK        = 0x00,
@@ -545,6 +546,21 @@ esp_err_t ld2410c_get_mac_address(ld2410c_handle_t *handle, uint8_t mac[6])
     return ESP_OK;
 }
 
+esp_err_t ld2410c_get_bluetooth(ld2410c_handle_t *handle, bool *enabled)
+{
+    CHECK_ARG(enabled);
+
+    /* The module reports this address instead of its own while Bluetooth is off */
+    static const uint8_t no_mac[6] = {0x08, 0x05, 0x04, 0x03, 0x02, 0x01};
+
+    uint8_t   mac[6];
+    esp_err_t err = ld2410c_get_mac_address(handle, mac);
+    if (err != ESP_OK) return err;
+
+    *enabled = memcmp(mac, no_mac, sizeof(mac)) != 0;
+    return ESP_OK;
+}
+
 esp_err_t ld2410c_set_bluetooth_password(ld2410c_handle_t *handle, const char password[6])
 {
     CHECK_ARG(password);
@@ -719,8 +735,8 @@ esp_err_t ld2410c_parse_engineering_data(const uint8_t *frame, size_t len, ld241
      * then tail(1) + check(1).
      *
      * The number of gates comes from the frame length, not from the max gate
-     * bytes: those report the configured range, while the module sends the
-     * energies of all gates (nine) even when fewer are configured.
+     * bytes: the module sends the energies of all nine gates whatever those
+     * bytes say (the ESPHome ld2410 component reads them at fixed offsets too).
      */
     if (data_len < ENG_DATA_OVERHEAD + 2 * MIN_ENG_GATES) return ESP_ERR_INVALID_SIZE;
     size_t gate_bytes = data_len - ENG_DATA_OVERHEAD;
@@ -764,6 +780,13 @@ esp_err_t ld2410c_read_data_frame(ld2410c_handle_t *handle, uint8_t *buf, size_t
 
     if (out_len) *out_len = frame_len;
     return ESP_OK;
+}
+
+esp_err_t ld2410c_flush_input(ld2410c_handle_t *handle)
+{
+    CHECK_ARG(handle);
+    handle->rx_pending_len = 0;
+    return uart_flush_input(handle->uart_port);
 }
 
 /* ---------- high-level functions ---------- */
@@ -816,13 +839,13 @@ esp_err_t ld2410c_configure_detection(ld2410c_handle_t *handle,
     esp_err_t err = ld2410c_set_max_gate_and_duration(handle, max_moving_gate,
                                                       max_stationary_gate, no_one_duration_s);
     if (err != ESP_OK) {
-        ld2410c_end_config(handle);
+        config_end(handle);
         return err;
     }
 
     err = ld2410c_set_all_gate_sensitivity(handle, moving_sensitivity, stationary_sensitivity);
     if (err != ESP_OK) {
-        ld2410c_end_config(handle);
+        config_end(handle);
         return err;
     }
 
@@ -839,7 +862,7 @@ esp_err_t ld2410c_get_firmware_string(ld2410c_handle_t *handle, char *buf, size_
     ld2410c_firmware_ver_t ver;
     esp_err_t err = ld2410c_read_firmware_version(handle, &ver);
     if (err != ESP_OK) {
-        ld2410c_end_config(handle);
+        config_end(handle);
         return err;
     }
 
@@ -861,13 +884,13 @@ esp_err_t ld2410c_get_full_config(ld2410c_handle_t *handle,
 
     esp_err_t err = ld2410c_read_params(handle, params);
     if (err != ESP_OK) {
-        ld2410c_end_config(handle);
+        config_end(handle);
         return err;
     }
 
     err = ld2410c_get_distance_resolution(handle, resolution);
     if (err != ESP_OK) {
-        ld2410c_end_config(handle);
+        config_end(handle);
         return err;
     }
 
@@ -881,7 +904,7 @@ esp_err_t ld2410c_factory_reset_and_restart(ld2410c_handle_t *handle)
 
     esp_err_t err = ld2410c_factory_reset(handle);
     if (err != ESP_OK) {
-        ld2410c_end_config(handle);
+        config_end(handle);
         return err;
     }
 
@@ -898,7 +921,7 @@ esp_err_t ld2410c_auto_calibrate(ld2410c_handle_t *handle, uint16_t duration_s, 
 
     esp_err_t err = ld2410c_start_noise_detection(handle, duration_s);
     if (err != ESP_OK) {
-        ld2410c_end_config(handle);
+        config_end(handle);
         return err;
     }
 
@@ -913,17 +936,27 @@ esp_err_t ld2410c_auto_calibrate(ld2410c_handle_t *handle, uint16_t duration_s, 
     TickType_t poll_ticks = pdMS_TO_TICKS(poll_interval_ms);
     if (poll_ticks == 0) poll_ticks = 1;
 
+    int failed_polls = 0;
     for (uint32_t i = 0; i < max_polls; i++) {
         vTaskDelay(poll_ticks);
 
-        CONFIG_BEGIN(handle);
-        ld2410c_noise_status_t status;
-        err = ld2410c_query_noise_detection_status(handle, &status);
-        esp_err_t end_err = config_end(handle);
+        ld2410c_noise_status_t status = LD2410C_NOISE_NOT_IN_PROGRESS;
+        err = config_begin(handle);
+        if (err == ESP_OK) {
+            err = ld2410c_query_noise_detection_status(handle, &status);
+            esp_err_t end_err = config_end(handle);
 
-        /* Report the query's own error first, not the one from leaving config mode */
-        if (err != ESP_OK) return err;
-        if (end_err != ESP_OK) return end_err;
+            /* Report the query's own error first, not the one from leaving config mode */
+            if (err == ESP_OK && end_err != ESP_OK) return end_err;
+        }
+
+        if (err != ESP_OK) {
+            /* A lost or garbled ACK says nothing about the calibration: ask again at the next poll */
+            bool transient = err == ESP_ERR_TIMEOUT || err == ESP_ERR_INVALID_RESPONSE;
+            if (!transient || ++failed_polls >= MAX_FAILED_POLLS) return err;
+            continue;
+        }
+        failed_polls = 0;
 
         if (status == LD2410C_NOISE_COMPLETED) {
             ESP_LOGI(TAG, "Noise calibration completed");
