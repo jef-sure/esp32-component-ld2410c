@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.1.5 — 2026-10-07
+
+### Behavior changes
+
+- **Query functions reject values the protocol does not define.** They used to
+  return `ESP_OK` with whatever the module (or a damaged ACK) carried; now they
+  return `ESP_ERR_INVALID_RESPONSE`:
+  - `ld2410c_get_distance_resolution()` for a resolution index other than 0 or 1;
+  - `ld2410c_get_aux_control()` for a light control mode above 2 or an OUT
+    level above 1;
+  - `ld2410c_query_noise_detection_status()` for a status above 2.
+    `ld2410c_auto_calibrate()` treats that as a garbled poll and asks again;
+  - `ld2410c_read_params()` (and `ld2410c_get_full_config()`) for a configured
+    max gate above the reported one or a sensitivity above 100. A max gate
+    below 2 is still accepted: the vendor document names 1 as valid in one
+    place.
+- **`ld2410c_get_firmware_string()`** returns `ESP_ERR_INVALID_SIZE` when the
+  buffer is too small for the version (it returned `ESP_OK` with a truncated
+  string). 16 bytes hold any version.
+
+### Fixed
+
+- `ld2410c_configure_detection()` entered config mode before it checked the
+  gates and sensitivities, so invalid arguments put the module into config mode and back
+  although the documentation promised no UART traffic. They are now rejected
+  first.
+- `ld2410c_factory_reset_and_restart()` sent `end_config` to the restarting
+  module and waited out the whole command timeout for an answer that could not
+  come. After an acknowledged restart nothing more is sent. If the restart
+  command fails, `end_config` is sent, with the usual retry.
+- Sample: the noise detection states (`0x04` to `0x06`) were logged as targets
+  and named `UNKNOWN`. It now uses `ld2410c_target_is_present()` and names them.
+- Sample: enabling engineering mode reported success when `end_config` failed,
+  although the module then stays in config mode and sends no reports.
+- `docs/protocol.md`: "There are 8 gates"; there are nine, 0 to 8.
+
+### Added
+
+- Host tests for the above.
+
 ## 0.1.4 — 2026-10-06
 
 Documentation only; the driver code is the same as in 0.1.2.

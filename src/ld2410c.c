@@ -429,15 +429,24 @@ esp_err_t ld2410c_read_params(ld2410c_handle_t *handle, ld2410c_params_t *params
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    uint8_t max_gate            = ret[1];
-    params->max_moving_gate     = ret[2];
-    params->max_stationary_gate = ret[3];
+    uint8_t max_gate = ret[1];
 
     uint8_t num_gates = max_gate + 1;
     size_t  expected  = 4 + num_gates + num_gates + 2; /* header+gates+mov_sens+stat_sens+duration */
     if (ret_len < expected) {
         return ESP_ERR_INVALID_SIZE;
     }
+
+    /* Only the upper bounds are checked: the vendor document also gives 1 as a valid max gate (section 1.2.2) */
+    if (ret[2] > max_gate || ret[3] > max_gate) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    for (int i = 0; i < 2 * num_gates; i++) {
+        if (ret[4 + i] > MAX_SENSITIVITY) return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    params->max_moving_gate     = ret[2];
+    params->max_stationary_gate = ret[3];
 
     memset(params->moving_sensitivity, 0, sizeof(params->moving_sensitivity));
     memset(params->stationary_sensitivity, 0, sizeof(params->stationary_sensitivity));
@@ -587,7 +596,9 @@ esp_err_t ld2410c_get_distance_resolution(ld2410c_handle_t *handle, ld2410c_reso
     if (err != ESP_OK) return err;
 
     if (ret_len < 2) return ESP_ERR_INVALID_SIZE;
-    *res = (ld2410c_resolution_t)get_u16(ret, 0);
+    uint16_t value = get_u16(ret, 0);
+    if (value > LD2410C_RESOLUTION_020M) return ESP_ERR_INVALID_RESPONSE;
+    *res = (ld2410c_resolution_t)value;
     return ESP_OK;
 }
 
@@ -616,6 +627,7 @@ esp_err_t ld2410c_get_aux_control(ld2410c_handle_t *handle, ld2410c_aux_ctrl_t *
     if (err != ESP_OK) return err;
 
     if (ret_len < 3) return ESP_ERR_INVALID_SIZE;
+    if (ret[0] > LD2410C_LIGHT_CTRL_ABOVE_THRESH || ret[2] > LD2410C_OUT_DEFAULT_HIGH) return ESP_ERR_INVALID_RESPONSE;
     ctrl->mode        = (ld2410c_light_ctrl_mode_t)ret[0];
     ctrl->threshold   = ret[1];
     ctrl->out_default = (ld2410c_out_level_t)ret[2];
@@ -639,7 +651,9 @@ esp_err_t ld2410c_query_noise_detection_status(ld2410c_handle_t *handle, ld2410c
     if (err != ESP_OK) return err;
 
     if (ret_len < 2) return ESP_ERR_INVALID_SIZE;
-    *status = (ld2410c_noise_status_t)get_u16(ret, 0);
+    uint16_t value = get_u16(ret, 0);
+    if (value > LD2410C_NOISE_COMPLETED) return ESP_ERR_INVALID_RESPONSE;
+    *status = (ld2410c_noise_status_t)value;
     return ESP_OK;
 }
 
@@ -834,6 +848,11 @@ esp_err_t ld2410c_configure_detection(ld2410c_handle_t *handle,
                                       uint8_t moving_sensitivity,
                                       uint8_t stationary_sensitivity)
 {
+    /* Checked here as well, so that invalid arguments do not put the module into config mode first */
+    CHECK_ARG(max_moving_gate >= MIN_CONFIG_GATE && max_moving_gate <= MAX_GATE);
+    CHECK_ARG(max_stationary_gate >= MIN_CONFIG_GATE && max_stationary_gate <= MAX_GATE);
+    CHECK_ARG(moving_sensitivity <= MAX_SENSITIVITY && stationary_sensitivity <= MAX_SENSITIVITY);
+
     CONFIG_BEGIN(handle);
 
     esp_err_t err = ld2410c_set_max_gate_and_duration(handle, max_moving_gate,
@@ -869,8 +888,9 @@ esp_err_t ld2410c_get_firmware_string(ld2410c_handle_t *handle, char *buf, size_
     CONFIG_END(handle);
 
     /* Version fields are BCD-style, so print them as hex: e.g. "V1.07.22091516" */
-    snprintf(buf, buf_size, "V%X.%02X.%08lX",
-             ver.major, ver.minor, (unsigned long)ver.patch);
+    int len = snprintf(buf, buf_size, "V%X.%02X.%08lX",
+                       ver.major, ver.minor, (unsigned long)ver.patch);
+    if (len < 0 || (size_t)len >= buf_size) return ESP_ERR_INVALID_SIZE; /* truncated */
     return ESP_OK;
 }
 
@@ -908,8 +928,11 @@ esp_err_t ld2410c_factory_reset_and_restart(ld2410c_handle_t *handle)
         return err;
     }
 
+    /* A restart leaves config mode by itself, and the restarting module would not answer end_config */
     err = ld2410c_restart(handle);
-    ld2410c_end_config(handle);  /* best-effort, module is restarting */
+    if (err != ESP_OK) {
+        config_end(handle);
+    }
     return err;
 }
 

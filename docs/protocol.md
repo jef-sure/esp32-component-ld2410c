@@ -272,7 +272,8 @@ ack   FD FC FB FA  04 00  A9 01  00 00  04 03 02 01
 
 ### 0x00AA / 0x00AB Distance resolution
 
-The length of one distance gate. There are 8 gates at either resolution.
+The length of one distance gate. There are nine gates, 0 to 8, at either
+resolution.
 
 | Index | Resolution |
 | --- | --- |

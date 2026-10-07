@@ -31,14 +31,14 @@ See [docs/module.md](docs/module.md) for pins, mounting and Bluetooth.
 Add this component to your ESP-IDF project using the IDF Component Manager:
 
 ```bash
-idf.py add-dependency "jef-sure/ld2410c^0.1.4"
+idf.py add-dependency "jef-sure/ld2410c^0.1.5"
 ```
 
 Or manually add to your project's `idf_component.yml`:
 
 ```yaml
 dependencies:
-  jef-sure/ld2410c: "^0.1.4"
+  jef-sure/ld2410c: "^0.1.5"
 ```
 
 ## Usage Example
@@ -139,8 +139,13 @@ Command functions return:
 - `ESP_OK` when the module acknowledged the command with status 0;
 - `ESP_FAIL` when it acknowledged with a failure status;
 - `ESP_ERR_TIMEOUT` when no ACK arrived within the handle's timeout;
-- `ESP_ERR_INVALID_RESPONSE` when the ACK was malformed or only an ACK for
-  another command arrived.
+- `ESP_ERR_INVALID_RESPONSE` when the ACK was malformed, only an ACK for
+  another command arrived, or a query answered with a value outside its range
+  (an unknown resolution, light control mode, OUT level or noise detection
+  status, a configured max gate above 8, a sensitivity above 100).
+
+`ld2410c_get_firmware_string()` returns `ESP_ERR_INVALID_SIZE` when the buffer
+is too small for the version string (16 bytes hold any version).
 
 `ld2410c_read_data_frame()` returns `ESP_ERR_TIMEOUT` when nothing was received
 and `ESP_ERR_NOT_FOUND` when bytes arrived but no complete frame.

@@ -146,8 +146,8 @@ typedef struct
 /** Radar configuration parameters as read from the module. */
 typedef struct
 {
-    uint8_t  max_moving_gate;                                    /**< Configured max moving gate (2-8). */
-    uint8_t  max_stationary_gate;                                /**< Configured max stationary gate (2-8). */
+    uint8_t  max_moving_gate;                                    /**< Configured max moving gate (normally 2-8, never above 8). */
+    uint8_t  max_stationary_gate;                                /**< Configured max stationary gate (normally 2-8, never above 8). */
     uint8_t  moving_sensitivity[LD2410C_MAX_DISTANCE_GATES];     /**< Per-gate moving sensitivity (0-100). */
     uint8_t  stationary_sensitivity[LD2410C_MAX_DISTANCE_GATES]; /**< Per-gate stationary sensitivity (0-100). */
     uint16_t no_one_duration;                                    /**< No-one timeout in seconds. */
@@ -244,6 +244,8 @@ esp_err_t ld2410c_set_max_gate_and_duration(ld2410c_handle_t *handle, uint8_t ma
 /**
  * @brief Read current configuration parameters (cmd 0x0061).
  * @param[out] params Populated with current gate/sensitivity/duration settings.
+ * @return ESP_ERR_INVALID_RESPONSE if the answer reports more than 9 gates, a
+ *         configured max gate above the reported one or a sensitivity above 100.
  */
 esp_err_t ld2410c_read_params(ld2410c_handle_t *handle, ld2410c_params_t *params);
 
@@ -325,6 +327,7 @@ esp_err_t ld2410c_set_distance_resolution(ld2410c_handle_t *handle, ld2410c_reso
 /**
  * @brief Query current distance resolution (cmd 0x00AB).
  * @param[out] res Current resolution setting.
+ * @return ESP_ERR_INVALID_RESPONSE if the module reports an unknown resolution index.
  */
 esp_err_t ld2410c_get_distance_resolution(ld2410c_handle_t *handle, ld2410c_resolution_t *res);
 
@@ -334,6 +337,7 @@ esp_err_t ld2410c_set_aux_control(ld2410c_handle_t *handle, const ld2410c_aux_ct
 /**
  * @brief Query current auxiliary control configuration (cmd 0x00AE).
  * @param[out] ctrl Current settings.
+ * @return ESP_ERR_INVALID_RESPONSE if the module reports an unknown mode or OUT level.
  */
 esp_err_t ld2410c_get_aux_control(ld2410c_handle_t *handle, ld2410c_aux_ctrl_t *ctrl);
 
@@ -349,6 +353,7 @@ esp_err_t ld2410c_start_noise_detection(ld2410c_handle_t *handle, uint16_t durat
 /**
  * @brief Query noise detection status (cmd 0x001B).
  * @param[out] status Current detection status.
+ * @return ESP_ERR_INVALID_RESPONSE if the module reports an unknown status.
  */
 esp_err_t ld2410c_query_noise_detection_status(ld2410c_handle_t *handle, ld2410c_noise_status_t *status);
 
@@ -445,7 +450,8 @@ esp_err_t ld2410c_flush_input(ld2410c_handle_t *handle);
 /**
  * @brief Configure detection range, timeout, and uniform sensitivity in one call.
  *
- * Automatically enters/exits configuration mode.
+ * Automatically enters/exits configuration mode. Out-of-range arguments are
+ * rejected before anything is sent to the module.
  *
  * @param max_moving_gate        Max moving gate (2-8).
  * @param max_stationary_gate    Max stationary gate (2-8).
@@ -466,7 +472,9 @@ esp_err_t ld2410c_configure_detection(       //
  * @brief Read firmware version as a formatted string (e.g. "V1.07.22091516").
  *
  * @param[out] buf      Destination buffer.
- * @param      buf_size Size of the buffer (recommend >= 16).
+ * @param      buf_size Size of the buffer, at least 16 to hold any version.
+ * @return ESP_ERR_INVALID_SIZE if the buffer is too small for the version; buf
+ *         then holds the truncated string.
  */
 esp_err_t ld2410c_get_firmware_string(ld2410c_handle_t *handle, char *buf, size_t buf_size);
 
@@ -482,6 +490,8 @@ esp_err_t ld2410c_get_full_config(ld2410c_handle_t *handle, ld2410c_params_t *pa
  * @brief Factory reset and restart the module in one call.
  *
  * Wait LD2410C_RESTART_DELAY_MS before the next command, see ld2410c_restart().
+ * The restart ends config mode, so no end_config is sent after it; if the
+ * factory reset or the restart command fails, config mode is left as usual.
  */
 esp_err_t ld2410c_factory_reset_and_restart(ld2410c_handle_t *handle);
 

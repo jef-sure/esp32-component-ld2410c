@@ -151,6 +151,23 @@ static void test_firmware_version(void)
     CHECK_EQ(ld2410c_get_firmware_string(ld, str, sizeof(str)), ESP_OK);
     CHECK(strcmp(str, "V1.07.22091516") == 0);
 
+    /* The string needs 15 bytes: a buffer that would truncate it is reported */
+    char exact[15];
+    mock_reset();
+    QUEUE(ACK_ENABLE);
+    QUEUE(ACK_FIRMWARE);
+    QUEUE(ACK_END);
+    CHECK_EQ(ld2410c_get_firmware_string(ld, exact, sizeof(exact)), ESP_OK);
+    CHECK(strcmp(exact, "V1.07.22091516") == 0);
+
+    char small[14];
+    mock_reset();
+    QUEUE(ACK_ENABLE);
+    QUEUE(ACK_FIRMWARE);
+    QUEUE(ACK_END);
+    CHECK_EQ(ld2410c_get_firmware_string(ld, small, sizeof(small)), ESP_ERR_INVALID_SIZE);
+    CHECK(strcmp(small, "V1.07.2209151") == 0);
+
     ld2410c_deinit(&ld);
     CHECK(ld == NULL);
 }
@@ -212,6 +229,131 @@ static void test_read_params(void)
         CHECK_EQ(params.stationary_sensitivity[i], 25);
     }
     CHECK_EQ(params.no_one_duration, 5);
+
+    /* Values the module cannot be configured with are a damaged answer, not a configuration */
+    static const struct {
+        size_t  offset; /* in ACK_PARAMS */
+        uint8_t value;
+    } bad[] = {
+        {12, 9},   /* configured max moving gate above the reported max gate */
+        {13, 9},   /* configured max stationary gate */
+        {14, 101}, /* moving sensitivity, gate 0 */
+        {22, 101}, /* moving sensitivity, gate 8 */
+        {23, 101}, /* stationary sensitivity, gate 0 */
+        {31, 255}, /* stationary sensitivity, gate 8 */
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        uint8_t ack[sizeof(ACK_PARAMS)];
+        memcpy(ack, ACK_PARAMS, sizeof(ack));
+        ack[bad[i].offset] = bad[i].value;
+        mock_reset();
+        QUEUE(ack);
+        CHECK_EQ(ld2410c_read_params(ld, &params), ESP_ERR_INVALID_RESPONSE);
+    }
+
+    /* The limits themselves are accepted, and so is a max gate of 1 (vendor document, section 1.2.2) */
+    uint8_t ack[sizeof(ACK_PARAMS)];
+    memcpy(ack, ACK_PARAMS, sizeof(ack));
+    ack[12] = 1;
+    ack[13] = 1;
+    ack[14] = 100;
+    ack[31] = 100;
+    mock_reset();
+    QUEUE(ack);
+    CHECK_EQ(ld2410c_read_params(ld, &params), ESP_OK);
+    CHECK_EQ(params.max_moving_gate, 1);
+    CHECK_EQ(params.max_stationary_gate, 1);
+    CHECK_EQ(params.moving_sensitivity[0], 100);
+    CHECK_EQ(params.stationary_sensitivity[8], 100);
+
+    ld2410c_deinit(&ld);
+}
+
+static void test_query_values_out_of_range(void)
+{
+    ld2410c_handle_t      *ld = new_handle();
+    ld2410c_resolution_t   res;
+    ld2410c_aux_ctrl_t     aux;
+    ld2410c_noise_status_t status;
+
+    /* Protocol example, 2.2.17: resolution 0.2 m */
+    uint8_t ack_res[] = {0xFD, 0xFC, 0xFB, 0xFA, 0x06, 0x00, 0xAB, 0x01, 0x00, 0x00, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01};
+    QUEUE(ack_res);
+    CHECK_EQ(ld2410c_get_distance_resolution(ld, &res), ESP_OK);
+    CHECK_EQ(res, LD2410C_RESOLUTION_020M);
+    ack_res[10] = 0x02;
+    mock_reset();
+    QUEUE(ack_res);
+    CHECK_EQ(ld2410c_get_distance_resolution(ld, &res), ESP_ERR_INVALID_RESPONSE);
+    ack_res[10] = 0x00;
+    ack_res[11] = 0x01;
+    mock_reset();
+    QUEUE(ack_res);
+    CHECK_EQ(ld2410c_get_distance_resolution(ld, &res), ESP_ERR_INVALID_RESPONSE);
+
+    /* Protocol example, 2.2.19: light below threshold 0x60, OUT default high */
+    uint8_t ack_aux[] = {0xFD, 0xFC, 0xFB, 0xFA, 0x08, 0x00, 0xAE, 0x01, 0x00, 0x00, 0x01, 0x60, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01};
+    mock_reset();
+    QUEUE(ack_aux);
+    CHECK_EQ(ld2410c_get_aux_control(ld, &aux), ESP_OK);
+    CHECK_EQ(aux.mode, LD2410C_LIGHT_CTRL_BELOW_THRESH);
+    CHECK_EQ(aux.threshold, 0x60);
+    CHECK_EQ(aux.out_default, LD2410C_OUT_DEFAULT_HIGH);
+    ack_aux[10] = 0x03;
+    mock_reset();
+    QUEUE(ack_aux);
+    CHECK_EQ(ld2410c_get_aux_control(ld, &aux), ESP_ERR_INVALID_RESPONSE);
+    ack_aux[10] = 0x02;
+    ack_aux[12] = 0x02;
+    mock_reset();
+    QUEUE(ack_aux);
+    CHECK_EQ(ld2410c_get_aux_control(ld, &aux), ESP_ERR_INVALID_RESPONSE);
+
+    uint8_t ack_noise[sizeof(ACK_NOISE_DONE)];
+    memcpy(ack_noise, ACK_NOISE_DONE, sizeof(ack_noise));
+    mock_reset();
+    QUEUE(ack_noise);
+    CHECK_EQ(ld2410c_query_noise_detection_status(ld, &status), ESP_OK);
+    CHECK_EQ(status, LD2410C_NOISE_COMPLETED);
+    ack_noise[10] = 0x03;
+    mock_reset();
+    QUEUE(ack_noise);
+    CHECK_EQ(ld2410c_query_noise_detection_status(ld, &status), ESP_ERR_INVALID_RESPONSE);
+
+    ld2410c_deinit(&ld);
+}
+
+static void test_factory_reset_and_restart(void)
+{
+    static const uint8_t ack_reset[]   = {0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xA2, 0x01, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01};
+    static const uint8_t ack_restart[] = {0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xA3, 0x01, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01};
+    ld2410c_handle_t    *ld            = new_handle();
+    size_t               tx_len;
+    const uint8_t       *tx;
+
+    /* The module restarts after the ACK: no end_config, so the call does not wait out a timeout */
+    QUEUE(ACK_ENABLE);
+    QUEUE(ack_reset);
+    QUEUE(ack_restart);
+    uint32_t start = mock_now();
+    CHECK_EQ(ld2410c_factory_reset_and_restart(ld), ESP_OK);
+    CHECK(mock_now() - start < TIMEOUT_MS);
+    CHECK_EQ(mock_write_count(), 3);
+    tx = mock_tx(&tx_len);
+    CHECK_EQ(tx_len, 14 + 12 + 12);
+    CHECK(tx_len == 38 && tx[6] == 0xFF && tx[20] == 0xA2 && tx[32] == 0xA3);
+
+    /* The restart was not acknowledged: the module may still be in config mode */
+    mock_reset();
+    QUEUE(ACK_ENABLE);
+    QUEUE(ack_reset);
+    static const uint8_t junk[] = {0x00};
+    QUEUE(junk);
+    QUEUE(ACK_END);
+    CHECK_EQ(ld2410c_factory_reset_and_restart(ld), ESP_ERR_TIMEOUT);
+    CHECK_EQ(mock_write_count(), 4);
+    tx = mock_tx(&tx_len);
+    CHECK(tx_len == 50 && tx[32] == 0xA3 && tx[44] == 0xFE);
 
     ld2410c_deinit(&ld);
 }
@@ -839,6 +981,12 @@ static void test_invalid_arguments(void)
 
     CHECK_EQ(ld2410c_auto_calibrate(ld, 10, 0), ESP_ERR_INVALID_ARG);
 
+    /* The wrapper checks its arguments before it enters config mode */
+    CHECK_EQ(ld2410c_configure_detection(ld, 1, 8, 5, 50, 50), ESP_ERR_INVALID_ARG);
+    CHECK_EQ(ld2410c_configure_detection(ld, 8, 9, 5, 50, 50), ESP_ERR_INVALID_ARG);
+    CHECK_EQ(ld2410c_configure_detection(ld, 8, 8, 5, 101, 50), ESP_ERR_INVALID_ARG);
+    CHECK_EQ(ld2410c_configure_detection(ld, 8, 8, 5, 50, 101), ESP_ERR_INVALID_ARG);
+
     /* None of the rejected calls reached the UART */
     CHECK_EQ(mock_write_count(), 0);
 
@@ -965,6 +1113,8 @@ int main(void)
     RUN(test_mac_address);
     RUN(test_target_state_helpers);
     RUN(test_read_params);
+    RUN(test_query_values_out_of_range);
+    RUN(test_factory_reset_and_restart);
     RUN(test_command_encoding);
     RUN(test_parse_basic);
     RUN(test_parse_engineering);

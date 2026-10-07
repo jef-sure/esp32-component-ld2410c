@@ -75,6 +75,9 @@ static const char *target_state_str(ld2410c_target_state_t state)
     case LD2410C_TARGET_MOVING:     return "MOVING";
     case LD2410C_TARGET_STATIONARY: return "STATIONARY";
     case LD2410C_TARGET_BOTH:       return "MOVING+STATIONARY";
+    case LD2410C_TARGET_NOISE_DET:  return "NOISE DETECTION";
+    case LD2410C_TARGET_NOISE_OK:   return "NOISE DETECTION OK";
+    case LD2410C_TARGET_NOISE_FAIL: return "NOISE DETECTION FAILED";
     default:                        return "UNKNOWN";
     }
 }
@@ -131,7 +134,8 @@ static void presence_monitor_task(void *arg)
             last_state = target.state;
         }
 
-        if (target.state != LD2410C_TARGET_NONE) {
+        /* The noise detection states (0x04 to 0x06) are not targets */
+        if (ld2410c_target_is_present(target.state)) {
             ESP_LOGI(TAG, "[%s] mov=%dcm energy=%d%% | stat=%dcm energy=%d%% | det=%dcm",
                      target_state_str(target.state),
                      target.moving_distance_cm, target.moving_energy,
@@ -196,7 +200,9 @@ void app_main(void)
     err = ld2410c_enable_config(s_ld);
     if (err == ESP_OK) {
         err = ld2410c_enable_engineering_mode(s_ld);
-        ld2410c_end_config(s_ld);
+        /* A module left in config mode sends no reports, so that is a failure too */
+        esp_err_t end_err = ld2410c_end_config(s_ld);
+        if (err == ESP_OK) err = end_err;
     }
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Engineering mode enabled");
